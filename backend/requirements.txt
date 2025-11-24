@@ -1,0 +1,58 @@
+# Core Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic>=2.11.7  # Updated to match project-x-py requirements
+pydantic-settings==2.1.0
+
+# TopstepX SDK
+project-x-py>=0.1.0
+
+# Data Processing
+polars>=1.31.0  # Updated to match project-x-py requirements
+numpy>=2.2.6
+pandas>=2.2.0
+
+# Async & HTTP
+aiohttp==3.9.1
+websockets==12.0
+httpx>=0.27.0  # Updated to match project-x-py requirements
+
+# Database
+sqlalchemy==2.0.23
+asyncpg>=0.30.0
+psycopg2-binary>=2.9.9
+alembic==1.12.1
+
+# Time & Timezone
+pytz>=2025.2  # Updated to match project-x-py requirements
+python-dateutil==2.8.2
+
+# Logging
+loguru==0.7.2
+
+# Technical Analysis
+# pandas-ta>=0.4.71b0  # Commented out - conflicts with scikit-learn, use pandas-ta only if needed
+# ta-lib==0.4.28  # Commented out - requires system library, install separately if needed
+# Note: Technical indicators can be calculated manually using pandas/numpy
+
+# ML/AI
+scikit-learn>=1.5.0  # Updated to support numpy 2.x
+xgboost>=2.0.3
+lightgbm>=4.1.0
+
+# Redis
+redis==5.0.1
+hiredis==2.2.3
+
+# YAML Configuration
+pyyaml==6.0.1
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+
+# Development
+black==23.11.0
+mypy==1.7.1
+ruff==0.1.6

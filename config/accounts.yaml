@@ -1,0 +1,27 @@
+accounts:
+  - account_id: practice_50k
+    name: Practice $50K
+    stage: practice
+    size: 50k
+    username: ${TOPSTEPX_USERNAME}
+    api_key: ${TOPSTEPX_API_KEY}
+    enabled_strategies:
+      - ict_silver_bullet
+      - vwap_mean_reversion
+    ai_agent_type: rule_based
+    paper_trading: true
+    enabled: true
+
+  - account_id: combine_50k_live
+    name: $50K Combine Live
+    stage: combine
+    size: 50k
+    username: live_username_here
+    api_key: live_api_key_here
+    enabled_strategies:
+      - trend_following
+      - opening_range_breakout
+    ai_agent_type: ml_confirmation
+    paper_trading: false
+    enabled: false
+

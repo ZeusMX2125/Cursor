@@ -1,0 +1,77 @@
+# TopstepX Multi-Account Configuration
+# Copy this file to accounts.yaml and configure your accounts
+
+accounts:
+  # Practice Account
+  - account_id: practice_50k
+    name: Practice $50K
+    stage: practice
+    size: 50k
+    username: your_username
+    api_key: your_api_key
+    enabled_strategies:
+      - ict_silver_bullet
+      - vwap_mean_reversion
+      - opening_range_breakout
+    ai_agent_type: rule_based  # rule_based, ml_confirmation, rl_agent
+    paper_trading: true
+    enabled: true
+
+  # $50K Combine Account
+  - account_id: combine_50k_1
+    name: $50K Combine #1
+    stage: combine
+    size: 50k
+    username: your_username
+    api_key: your_api_key
+    enabled_strategies:
+      - ict_silver_bullet
+      - trend_following
+    ai_agent_type: ml_confirmation
+    paper_trading: false
+    enabled: true
+
+  # $100K Combine Account
+  - account_id: combine_100k_1
+    name: $100K Combine #1
+    stage: combine
+    size: 100k
+    username: your_username
+    api_key: your_api_key
+    enabled_strategies:
+      - vwap_mean_reversion
+      - trend_following
+    ai_agent_type: ml_confirmation
+    paper_trading: false
+    enabled: true
+
+  # $150K Combine Account
+  - account_id: combine_150k_1
+    name: $150K Combine #1
+    stage: combine
+    size: 150k
+    username: your_username
+    api_key: your_api_key
+    enabled_strategies:
+      - opening_range_breakout
+      - trend_following
+    ai_agent_type: rl_agent
+    paper_trading: false
+    enabled: true
+
+  # Express Funded Account
+  - account_id: express_funded_1
+    name: Express Funded #1
+    stage: express_funded
+    size: 50k
+    username: your_username
+    api_key: your_api_key
+    enabled_strategies:
+      - ict_silver_bullet
+      - vwap_mean_reversion
+      - opening_range_breakout
+      - trend_following
+    ai_agent_type: rl_agent
+    paper_trading: false
+    enabled: true
+

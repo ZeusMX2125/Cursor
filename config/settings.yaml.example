@@ -1,0 +1,27 @@
+# Trading Parameters
+trading:
+  account_size: 50000
+  profit_target: 3000.0
+  daily_loss_limit: 1000.0
+  max_drawdown_limit: 2000.0
+  risk_per_trade_percent: 1.5
+  max_position_size: 5
+  min_position_size: 1
+
+# Strategy Configuration
+strategies:
+  default: "ict_silver_bullet"
+  enable_long_entries: true
+  enable_short_entries: true
+
+# Time Management
+time:
+  timezone: "America/Chicago"
+  hard_close_time: "15:05"
+  trading_start_time: "17:00"
+
+# Backtesting
+backtesting:
+  slippage_per_contract: 0.50
+  commission_per_contract: 0.85
+

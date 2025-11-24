@@ -1,0 +1,26 @@
+{
+  "ict_silver_bullet": {
+    "time_window_start": "09:00",
+    "time_window_end": "10:00",
+    "min_confidence": 0.7,
+    "risk_reward_ratio": 2.0
+  },
+  "vwap_mean_reversion": {
+    "rsi_period": 14,
+    "rsi_oversold": 40,
+    "rsi_overbought": 60,
+    "atr_multiplier": 1.5,
+    "risk_reward_ratio": 1.5
+  },
+  "opening_range_breakout": {
+    "range_start": "08:30",
+    "range_end": "08:45",
+    "risk_reward_ratio": 1.5
+  },
+  "trend_following": {
+    "ema_periods": [10, 20, 50, 200],
+    "atr_multiplier": 1.5,
+    "risk_reward_ratio": 2.0
+  }
+}
+
