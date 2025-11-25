@@ -35,6 +35,9 @@ from api.ml_endpoints import router as ml_router
 
 app = FastAPI(title="TopstepX Trading Bot API", version="1.0.0")
 
+# Shared timeout for ProjectX API calls (configurable via env)
+PROJECTX_API_TIMEOUT_SECONDS = float(os.getenv("PROJECTX_API_TIMEOUT_SECONDS", "12"))
+
 # Include ML router
 app.include_router(ml_router)
 
@@ -847,7 +850,7 @@ async def get_account_status(account_id: str):
         try:
             accounts = await asyncio.wait_for(
                 projectx_service.get_accounts(),
-                timeout=8.0
+                timeout=PROJECTX_API_TIMEOUT_SECONDS
             )
             for account in accounts:
                 if str(account.get("id")) == str(account_id):
@@ -954,19 +957,21 @@ async def _build_dashboard_state() -> Dict:
         raise HTTPException(status_code=503, detail="ProjectX service not initialized")
 
     try:
-        # Add timeout to prevent hanging - 8 seconds total (frontend timeout is 10s)
+        # Add timeout to prevent hanging - configurable (defaults to 12s)
         projectx_accounts, positions, orders_summary, trades_summary = await asyncio.wait_for(
             asyncio.gather(
                 projectx_service.get_accounts(),
-                projectx_service.get_positions(),
-                projectx_service.get_orders(),
-                projectx_service.get_trades_summary(),
+                projectx_service.get_positions(timeout=PROJECTX_API_TIMEOUT_SECONDS, allow_stale=True),
+                projectx_service.get_orders(timeout=PROJECTX_API_TIMEOUT_SECONDS, allow_stale=True),
+                projectx_service.get_trades_summary(timeout=PROJECTX_API_TIMEOUT_SECONDS, allow_stale=True),
                 return_exceptions=True  # Don't fail if one call fails
             ),
-            timeout=8.0  # 8 second timeout
+            timeout=PROJECTX_API_TIMEOUT_SECONDS
         )
     except asyncio.TimeoutError:
-        logger.error("Timeout building dashboard state - API calls took too long")
+        logger.error(
+            f"Timeout building dashboard state - API calls exceeded {PROJECTX_API_TIMEOUT_SECONDS:.1f}s"
+        )
         # Return empty data instead of failing
         projectx_accounts = []
         positions = []
@@ -1447,13 +1452,23 @@ async def get_positions(account_id: int):
 
     try:
         positions = await asyncio.wait_for(
-            projectx_service.get_positions(account_id=account_id),
-            timeout=8.0
+            projectx_service.get_positions(
+                account_id=account_id,
+                timeout=PROJECTX_API_TIMEOUT_SECONDS,
+                allow_stale=True
+            ),
+            timeout=PROJECTX_API_TIMEOUT_SECONDS
         )
         return {"positions": positions}
     except asyncio.TimeoutError:
-        logger.error(f"Timeout fetching positions for account {account_id}")
-        raise HTTPException(status_code=504, detail="Request timeout - backend may be overloaded")
+        logger.error(
+            f"Timeout fetching positions for account {account_id} after {PROJECTX_API_TIMEOUT_SECONDS}s"
+        )
+        return {
+            "positions": [],
+            "stale": True,
+            "message": "Positions request timed out - showing empty results",
+        }
     except Exception as e:
         logger.error(f"Error fetching positions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
@@ -1467,13 +1482,23 @@ async def get_pending_orders(account_id: int):
 
     try:
         orders = await asyncio.wait_for(
-            projectx_service.get_orders(account_id=account_id),
-            timeout=8.0
+            projectx_service.get_orders(
+                account_id=account_id,
+                timeout=PROJECTX_API_TIMEOUT_SECONDS,
+                allow_stale=True
+            ),
+            timeout=PROJECTX_API_TIMEOUT_SECONDS
         )
         return {"orders": orders.get("open", [])}
     except asyncio.TimeoutError:
-        logger.error(f"Timeout fetching pending orders for account {account_id}")
-        raise HTTPException(status_code=504, detail="Request timeout - backend may be overloaded")
+        logger.error(
+            f"Timeout fetching pending orders for account {account_id} after {PROJECTX_API_TIMEOUT_SECONDS}s"
+        )
+        return {
+            "orders": [],
+            "stale": True,
+            "message": "Pending orders request timed out - showing empty results",
+        }
     except Exception as e:
         logger.error(f"Error fetching pending orders: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to fetch orders: {str(e)}")
@@ -1487,14 +1512,24 @@ async def get_previous_orders(account_id: int, limit: int = 50):
 
     try:
         orders = await asyncio.wait_for(
-            projectx_service.get_orders(account_id=account_id),
-            timeout=8.0
+            projectx_service.get_orders(
+                account_id=account_id,
+                timeout=PROJECTX_API_TIMEOUT_SECONDS,
+                allow_stale=True
+            ),
+            timeout=PROJECTX_API_TIMEOUT_SECONDS
         )
         recent = orders.get("recent", [])
         return {"orders": recent[:limit]}
     except asyncio.TimeoutError:
-        logger.error(f"Timeout fetching previous orders for account {account_id}")
-        raise HTTPException(status_code=504, detail="Request timeout - backend may be overloaded")
+        logger.error(
+            f"Timeout fetching previous orders for account {account_id} after {PROJECTX_API_TIMEOUT_SECONDS}s"
+        )
+        return {
+            "orders": [],
+            "stale": True,
+            "message": "Previous orders request timed out - showing empty results",
+        }
     except Exception as e:
         logger.error(f"Error fetching previous orders: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to fetch orders: {str(e)}")

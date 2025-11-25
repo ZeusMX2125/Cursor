@@ -74,17 +74,23 @@ const normalizeSymbol = (symbol: string): string => {
 const getPriceMultiplier = (source: any): number => {
   const pointValue = typeof source?.point_value === 'number' && Number.isFinite(source.point_value)
     ? source.point_value
-    : undefined
+    : typeof source?.pointValue === 'number' && Number.isFinite(source.pointValue)
+      ? source.pointValue
+      : undefined
   if (pointValue && pointValue !== 0) {
     return pointValue
   }
 
   const tickValue = typeof source?.tick_value === 'number' && Number.isFinite(source.tick_value)
     ? source.tick_value
-    : undefined
+    : typeof source?.tickValue === 'number' && Number.isFinite(source.tickValue)
+      ? source.tickValue
+      : undefined
   const tickSize = typeof source?.tick_size === 'number' && Number.isFinite(source.tick_size)
     ? source.tick_size
-    : undefined
+    : typeof source?.tickSize === 'number' && Number.isFinite(source.tickSize)
+      ? source.tickSize
+      : undefined
 
   if (tickValue && tickSize && tickSize !== 0) {
     return tickValue / tickSize
@@ -148,9 +154,24 @@ const normalizePosition = (position: any): Position => {
     unrealized_pnl: unrealized,
     realized_pnl: typeof position.realized_pnl === 'number' ? position.realized_pnl : undefined,
     pnl_percent: pnlPercent,
-    tick_size: typeof position.tick_size === 'number' ? position.tick_size : undefined,
-    tick_value: typeof position.tick_value === 'number' ? position.tick_value : undefined,
-    point_value: typeof position.point_value === 'number' ? position.point_value : undefined,
+    tick_size:
+      typeof position.tick_size === 'number'
+        ? position.tick_size
+        : typeof position.tickSize === 'number'
+          ? position.tickSize
+          : undefined,
+    tick_value:
+      typeof position.tick_value === 'number'
+        ? position.tick_value
+        : typeof position.tickValue === 'number'
+          ? position.tickValue
+          : undefined,
+    point_value:
+      typeof position.point_value === 'number'
+        ? position.point_value
+        : typeof position.pointValue === 'number'
+          ? position.pointValue
+          : undefined,
   }
 }
 
@@ -246,18 +267,19 @@ const handleRealtimeSnapshot = (snapshot: any) => {
       )
       if (existing && existing.current_price && existing.current_price !== normalized.entry_price) {
         // Use existing position's quote-updated price and recalculate P&L
+        const priceMultiplier = getPriceMultiplier(normalized)
         const entryPrice = normalized.entry_price ?? existing.entry_price ?? 0
         const currentPrice = existing.current_price
         const quantity = normalized.quantity ?? existing.quantity ?? 0
         const direction = normalized.side === 'SHORT' ? -1 : 1
-        const entryValue = entryPrice * Math.abs(quantity)
-        const unrealized = (currentPrice - entryPrice) * Math.abs(quantity) * direction
+        const entryValue = entryPrice * Math.abs(quantity) * priceMultiplier
+        const unrealized = (currentPrice - entryPrice) * Math.abs(quantity) * priceMultiplier * direction
         const pnlPercent = entryValue ? (unrealized / entryValue) * 100 : 0
         
         return {
           ...normalized,
           current_price: currentPrice,
-          current_value: currentPrice * Math.abs(quantity),
+          current_value: currentPrice * Math.abs(quantity) * priceMultiplier,
           entry_value: entryValue,
           unrealized_pnl: unrealized,
           pnl_percent: pnlPercent,

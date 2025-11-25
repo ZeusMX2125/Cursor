@@ -84,6 +84,9 @@ class ProjectXService:
 
     ACCOUNTS_TTL_SECONDS = 60
     CONTRACTS_TTL_SECONDS = 300
+    POSITIONS_TTL_SECONDS = 10
+    ORDERS_TTL_SECONDS = 15
+    TRADES_TTL_SECONDS = 20
 
     def __init__(self, client: TopstepXClient):
         self.client = client
@@ -96,6 +99,62 @@ class ProjectXService:
         self._balance_high_water: Optional[float] = None
         self._contract_lookup_cache: Dict[str, Dict[str, Optional[float]]] = {}
         self._contract_lookup_expiry: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        self._positions_cache: Dict[Optional[int], Dict[str, Any]] = {}
+        self._orders_cache: Dict[Optional[int], Dict[str, Any]] = {}
+        self._trades_cache: Dict[Optional[int], Dict[str, Any]] = {}
+
+    def _get_cached_value(
+        self,
+        cache: Dict[Optional[int], Dict[str, Any]],
+        key: Optional[int],
+        ttl_seconds: int,
+    ) -> Optional[Any]:
+        """Get cached value if it exists and hasn't expired."""
+        cached = cache.get(key)
+        if not cached:
+            return None
+
+        expiry: datetime = cached.get("expiry", datetime.min.replace(tzinfo=timezone.utc))
+        if _utc_now() > expiry:
+            return None
+        return cached.get("data")
+
+    def _set_cached_value(
+        self,
+        cache: Dict[Optional[int], Dict[str, Any]],
+        key: Optional[int],
+        data: Any,
+        ttl_seconds: int,
+    ) -> None:
+        """Store value in cache with expiry."""
+        cache[key] = {
+            "data": data,
+            "expiry": _utc_now() + timedelta(seconds=ttl_seconds),
+            "cached_at": _utc_now(),
+        }
+
+    def _get_stale_value(
+        self, cache: Dict[Optional[int], Dict[str, Any]], key: Optional[int]
+    ) -> Optional[Any]:
+        """Get cached value even if expired (for fallback scenarios)."""
+        cached = cache.get(key)
+        if cached:
+            return cached.get("data")
+        return None
+
+    def get_cached_positions(self, account_id: Optional[int] = None) -> Optional[Any]:
+        """Get stale cached positions (for fallback)."""
+        return self._get_stale_value(self._positions_cache, account_id)
+
+    def get_cached_orders(self, account_id: Optional[int] = None) -> Optional[Any]:
+        """Get stale cached orders (for fallback)."""
+        return self._get_stale_value(self._orders_cache, account_id)
+
+    def get_cached_trades_summary(
+        self, account_id: Optional[int] = None
+    ) -> Optional[Any]:
+        """Get stale cached trades summary (for fallback)."""
+        return self._get_stale_value(self._trades_cache, account_id)
 
     async def get_accounts(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         """Return cached account list."""
@@ -128,9 +187,52 @@ class ProjectXService:
             self._balance_high_water = balance
         return balance
 
-    async def get_positions(self, account_id: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Return open positions for the resolved account enriched with P&L metrics."""
-        positions = await self.client.get_open_positions(account_id=account_id)
+    async def get_positions(
+        self,
+        account_id: Optional[int] = None,
+        *,
+        timeout: Optional[float] = None,
+        allow_stale: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return open positions for the resolved account enriched with P&L metrics.
+
+        Falls back to cached data if the upstream call times out or fails and stale
+        data is allowed. This improves resiliency for dashboard endpoints that have
+        tight frontend timeouts.
+        """
+        cache_key = account_id
+        cached = self._get_cached_value(
+            self._positions_cache, cache_key, self.POSITIONS_TTL_SECONDS
+        )
+        if cached is not None:
+            return cached
+
+        try:
+            positions_coro = self.client.get_open_positions(account_id=account_id)
+            positions = (
+                await asyncio.wait_for(positions_coro, timeout=timeout)
+                if timeout
+                else await positions_coro
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Timeout retrieving positions for account {account_id}; returning cached data"
+            )
+            if allow_stale:
+                stale = self._get_stale_value(self._positions_cache, cache_key)
+                if stale is not None:
+                    return stale
+            raise
+        except Exception as exc:
+            logger.warning(
+                f"Error retrieving positions for account {account_id}: {exc}; using cached data",
+                exc_info=True,
+            )
+            if allow_stale:
+                stale = self._get_stale_value(self._positions_cache, cache_key)
+                if stale is not None:
+                    return stale
+            raise
 
         contract_lookup = await self._ensure_contract_lookup()
 
@@ -208,6 +310,13 @@ class ProjectXService:
                     "account_id": account_id or pos.get("account_id"),  # Ensure account_id is included
                 }
             )
+
+        self._set_cached_value(
+            self._positions_cache,
+            cache_key,
+            enriched,
+            self.POSITIONS_TTL_SECONDS,
+        )
         return enriched
 
     async def _ensure_contract_lookup(self) -> Dict[str, Dict[str, Optional[float]]]:
@@ -264,38 +373,124 @@ class ProjectXService:
         self,
         account_id: Optional[int] = None,
         hours: int = 24,
+        *,
+        timeout: Optional[float] = None,
+        allow_stale: bool = True,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """Return open and recently closed orders."""
-        end_ts = _utc_now()
-        start_ts = end_ts - timedelta(hours=hours)
-        open_orders, recent_orders = await asyncio.gather(
-            self.client.get_open_orders(account_id=account_id),
-            self.client.get_orders(
-                account_id=account_id,
-                start_timestamp=start_ts.isoformat(),
-                end_timestamp=end_ts.isoformat(),
-            ),
+        """Return open and recently closed orders with caching and timeouts."""
+
+        cache_key = account_id
+        cached = self._get_cached_value(
+            self._orders_cache, cache_key, self.ORDERS_TTL_SECONDS
         )
-        return {"open": open_orders, "recent": recent_orders}
+        if cached is not None:
+            return cached
+
+        async def _with_timeout(coro: Any) -> Any:
+            if timeout:
+                return await asyncio.wait_for(coro, timeout=timeout)
+            return await coro
+
+        try:
+            end_ts = _utc_now()
+            start_ts = end_ts - timedelta(hours=hours)
+            open_orders, recent_orders = await asyncio.gather(
+                _with_timeout(self.client.get_open_orders(account_id=account_id)),
+                _with_timeout(
+                    self.client.get_orders(
+                        account_id=account_id,
+                        start_timestamp=start_ts.isoformat(),
+                        end_timestamp=end_ts.isoformat(),
+                    )
+                ),
+            )
+            summary = {"open": open_orders, "recent": recent_orders}
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Timeout retrieving orders for account {account_id}; returning cached data"
+            )
+            if allow_stale:
+                stale = self._get_stale_value(self._orders_cache, cache_key)
+                if stale is not None:
+                    return stale
+            raise
+        except Exception as exc:
+            logger.warning(
+                f"Error retrieving orders for account {account_id}: {exc}; using cached data",
+                exc_info=True,
+            )
+            if allow_stale:
+                stale = self._get_stale_value(self._orders_cache, cache_key)
+                if stale is not None:
+                    return stale
+            raise
+
+        self._set_cached_value(
+            self._orders_cache,
+            cache_key,
+            summary,
+            self.ORDERS_TTL_SECONDS,
+        )
+        return summary
 
     async def get_trades_summary(
-        self, account_id: Optional[int] = None, hours: int = 24
+        self,
+        account_id: Optional[int] = None,
+        hours: int = 24,
+        *,
+        timeout: Optional[float] = None,
+        allow_stale: bool = True,
     ) -> Dict[str, Any]:
         """Return trade list and computed metrics for dashboard/stat cards.
+
+        Uses caching and timeouts to avoid blocking dashboard rendering when the
+        upstream API is slow.
         
         Includes both completed trades and half-turn trades for accurate P&L calculation.
         Half-turn trades (profitAndLoss is null) are incomplete round-turns that need to be
         paired with their matching trades to calculate realized P&L correctly.
         """
-        end_ts = _utc_now()
-        start_ts = end_ts - timedelta(hours=hours)
-        
-        # Get all trades (half-turn trades are included, identified by profitAndLoss being null)
-        all_trades = await self.client.get_trades(
-            account_id=account_id,
-            start_timestamp=start_ts.isoformat(),
-            end_timestamp=end_ts.isoformat(),
+
+        cache_key = account_id
+        cached = self._get_cached_value(
+            self._trades_cache, cache_key, self.TRADES_TTL_SECONDS
         )
+        if cached is not None:
+            return cached
+
+        try:
+            end_ts = _utc_now()
+            start_ts = end_ts - timedelta(hours=hours)
+
+            trades_coro = self.client.get_trades(
+                account_id=account_id,
+                start_timestamp=start_ts.isoformat(),
+                end_timestamp=end_ts.isoformat(),
+            )
+            all_trades = (
+                await asyncio.wait_for(trades_coro, timeout=timeout)
+                if timeout
+                else await trades_coro
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Timeout retrieving trades for account {account_id}; returning cached data"
+            )
+            if allow_stale:
+                stale = self._get_stale_value(self._trades_cache, cache_key)
+                if stale is not None:
+                    return stale
+            raise
+        except Exception as exc:
+            logger.warning(
+                f"Error retrieving trades for account {account_id}: {exc}; using cached data",
+                exc_info=True,
+            )
+            if allow_stale:
+                stale = self._get_stale_value(self._trades_cache, cache_key)
+                if stale is not None:
+                    return stale
+            raise
         
         # Get P&L values from trades (includes commissions from TopStep)
         # profitAndLoss field in trades already includes commissions
@@ -325,6 +520,12 @@ class ProjectXService:
                 "tradesToday": trades_today,
             },
         }
+        self._set_cached_value(
+            self._trades_cache,
+            cache_key,
+            summary,
+            self.TRADES_TTL_SECONDS,
+        )
         return summary
 
     async def get_realized_pnl_for_positions(

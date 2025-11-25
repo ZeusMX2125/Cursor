@@ -17,7 +17,7 @@ import api from '@/lib/api'
 import { subscribeToWebSocketMessages } from '@/lib/websocket'
 import type { AccountSnapshot, Position, ProjectXOrder } from '@/types/dashboard'
 import { useContracts } from '@/contexts/ContractsContext'
-import { getContractDisplayName } from '@/lib/contractUtils'
+import { getContractDisplayName, quoteMatchesChartSymbol } from '@/lib/contractUtils'
 
 export default function TradingPage() {
   const { data, loading, error, refresh } = useDashboardData({ pollInterval: 7000 })
@@ -87,6 +87,107 @@ export default function TradingPage() {
     }
   }, [data, selectedAccountId, botAccountId])
 
+  // Helper to parse numbers defensively
+  const parseNumber = (value: any): number | undefined => {
+    if (value === null || value === undefined) return undefined
+    const num = Number(value)
+    return Number.isFinite(num) ? num : undefined
+  }
+
+  // Helper to get price multiplier from position metadata
+  const getPriceMultiplier = (position: any): number => {
+    const pointValue = typeof position?.point_value === 'number' && Number.isFinite(position.point_value)
+      ? position.point_value
+      : typeof position?.pointValue === 'number' && Number.isFinite(position.pointValue)
+        ? position.pointValue
+        : undefined
+    if (pointValue && pointValue !== 0) {
+      return pointValue
+    }
+
+    const tickValue = typeof position?.tick_value === 'number' && Number.isFinite(position.tick_value)
+      ? position.tick_value
+      : typeof position?.tickValue === 'number' && Number.isFinite(position.tickValue)
+        ? position.tickValue
+        : undefined
+    const tickSize = typeof position?.tick_size === 'number' && Number.isFinite(position.tick_size)
+      ? position.tick_size
+      : typeof position?.tickSize === 'number' && Number.isFinite(position.tickSize)
+        ? position.tickSize
+        : undefined
+
+    if (tickValue && tickSize && tickSize !== 0) {
+      return tickValue / tickSize
+    }
+
+    return 1
+  }
+
+  // Helper to normalize position data - prefer API-provided values, use correct multipliers
+  const normalizePosition = (position: any): Position => {
+    const sideLabel = (position.side || position.type || 'LONG').toString().toUpperCase().includes('SHORT') ? 'SHORT' : 'LONG'
+    const quantity = parseNumber(position.quantity ?? position.size ?? 0) || 0
+    const entryPrice = parseNumber(position.entry_price ?? position.averagePrice ?? position.price ?? 0) || 0
+    const currentPrice = parseNumber(
+      position.current_price ??
+        position.marketPrice ??
+        position.lastPrice ??
+        entryPrice
+    ) || entryPrice
+    
+    const direction = sideLabel === 'SHORT' ? -1 : 1
+    const priceMultiplier = getPriceMultiplier(position)
+    
+    // Use API-provided values when available, calculate only as fallback with correct multiplier
+    const entryValue = typeof position.entry_value === 'number' && Number.isFinite(position.entry_value)
+      ? position.entry_value
+      : entryPrice * Math.abs(quantity) * priceMultiplier
+    
+    const currentValue = typeof position.current_value === 'number' && Number.isFinite(position.current_value)
+      ? position.current_value
+      : currentPrice * Math.abs(quantity) * priceMultiplier
+    
+    const unrealized = typeof position.unrealized_pnl === 'number' && Number.isFinite(position.unrealized_pnl)
+      ? position.unrealized_pnl
+      : (currentPrice - entryPrice) * Math.abs(quantity) * priceMultiplier * direction
+    
+    const pnlPercent = typeof position.pnl_percent === 'number' && Number.isFinite(position.pnl_percent)
+      ? position.pnl_percent
+      : (entryValue ? (unrealized / entryValue) * 100 : 0)
+    
+    return {
+      position_id: position.position_id ?? position.id ?? undefined,
+      contract_id: position.contract_id,
+      symbol: position.symbol ?? position.contractId ?? '',
+      side: sideLabel,
+      quantity,
+      entry_price: entryPrice,
+      current_price: currentPrice,
+      entry_time: position.entry_time ?? position.creationTimestamp ?? position.timestamp,
+      account_id: position.account_id ?? position.accountId,
+      entry_value: entryValue,
+      current_value: currentValue,
+      unrealized_pnl: unrealized,
+      realized_pnl: typeof position.realized_pnl === 'number' ? position.realized_pnl : undefined,
+      pnl_percent: pnlPercent,
+      tick_size: typeof position.tick_size === 'number'
+        ? position.tick_size
+        : typeof position.tickSize === 'number'
+          ? position.tickSize
+          : undefined,
+      tick_value: typeof position.tick_value === 'number'
+        ? position.tick_value
+        : typeof position.tickValue === 'number'
+          ? position.tickValue
+          : undefined,
+      point_value: typeof position.point_value === 'number'
+        ? position.point_value
+        : typeof position.pointValue === 'number'
+          ? position.pointValue
+          : undefined,
+    }
+  }
+
   const fetchTradingData = useCallback(
     async (accountId?: string) => {
       if (!accountId) {
@@ -110,40 +211,27 @@ export default function TradingPage() {
           api.get(`/api/trading/previous-orders/${accountId}`),
         ])
         
-        // Ensure positions have account_id set and preserve all P&L fields and metadata
+        // Ensure positions have account_id set and normalize using helper
         const positionsWithAccount = (positionsRes.data.positions ?? []).map((p: any) => {
-          const position: Position = {
-            ...p,
-            account_id: p.account_id || accountId,
-            // Ensure all P&L fields are preserved from API
-            unrealized_pnl: typeof p.unrealized_pnl === 'number' ? p.unrealized_pnl : undefined,
-            realized_pnl: typeof p.realized_pnl === 'number' ? p.realized_pnl : undefined,
-            entry_value: typeof p.entry_value === 'number' ? p.entry_value : undefined,
-            current_value: typeof p.current_value === 'number' ? p.current_value : undefined,
-            pnl_percent: typeof p.pnl_percent === 'number' ? p.pnl_percent : undefined,
-            // Preserve tick/point metadata for accurate P&L calculations
-            tick_size: typeof p.tick_size === 'number' ? p.tick_size : undefined,
-            tick_value: typeof p.tick_value === 'number' ? p.tick_value : undefined,
-            point_value: typeof p.point_value === 'number' ? p.point_value : undefined,
-          }
-          
+          const normalized = normalizePosition({ ...p, account_id: p.account_id || accountId })
+
           // Debug logging in development
           if (process.env.NODE_ENV === 'development') {
             console.log('[TradingPage] Position from API:', {
-              symbol: position.symbol,
-              unrealized_pnl: position.unrealized_pnl,
-              current_price: position.current_price,
-              entry_price: position.entry_price,
-              quantity: position.quantity,
-              side: position.side,
-              tick_size: position.tick_size,
-              tick_value: position.tick_value,
-              point_value: position.point_value,
+              symbol: normalized.symbol,
+              unrealized_pnl: normalized.unrealized_pnl,
+              current_price: normalized.current_price,
+              entry_price: normalized.entry_price,
+              quantity: normalized.quantity,
+              side: normalized.side,
+              tick_size: normalized.tick_size,
+              tick_value: normalized.tick_value,
+              point_value: normalized.point_value,
               raw: p
             })
           }
-          
-          return position
+
+          return normalized
         })
         
         setAccountPositions(positionsWithAccount)
@@ -176,6 +264,46 @@ export default function TradingPage() {
     return () => clearInterval(interval)
   }, [selectedAccountId, fetchTradingData])
   
+  // Normalize & match symbols so we only apply quotes to the correct contract month
+  const matchesSymbol = useCallback(
+    (quoteSymbol: string, positionSymbol: string): boolean => {
+      if (!quoteSymbol || !positionSymbol) return false
+
+      // Exact match (fast path)
+      if (quoteSymbol.toUpperCase() === positionSymbol.toUpperCase()) return true
+
+      // Use contract metadata when available for precise matching (avoids mixing months)
+      if (contracts.length && quoteMatchesChartSymbol(quoteSymbol, positionSymbol, contracts)) {
+        return true
+      }
+
+      // Fallback: compare sanitized symbols (letters+digits only)
+      const normalize = (s: string) => s.toUpperCase().replace(/[^A-Z0-9]/g, '')
+      const normQuote = normalize(quoteSymbol)
+      const normPos = normalize(positionSymbol)
+
+      if (normQuote === normPos) return true
+
+      // If both contain month/year codes, require them to match to avoid cross-contract contamination
+      const quoteBase = normQuote.replace(/[0-9]/g, '')
+      const posBase = normPos.replace(/[0-9]/g, '')
+      const quoteMonthYear = normQuote.slice(quoteBase.length)
+      const posMonthYear = normPos.slice(posBase.length)
+
+      if (quoteBase === posBase && quoteMonthYear && posMonthYear) {
+        return quoteMonthYear === posMonthYear
+      }
+
+      // As a last resort, allow base symbol match (e.g., MES vs MESZ25) only when month/year not provided
+      if (quoteBase === posBase && (!quoteMonthYear || !posMonthYear)) {
+        return true
+      }
+
+      return false
+    },
+    [contracts]
+  )
+  
   // Listen for WebSocket quote updates ONLY - update prices and recalculate P&L locally
   // Single source of truth: API provides position structure/metadata, WebSocket provides live prices
   useEffect(() => {
@@ -201,19 +329,14 @@ export default function TradingPage() {
             console.log(`[TradingPage] Quote update: ${quoteSymbol} = ${quotePrice}`)
           }
           
-          // Update positions that match this symbol
+          // Update positions that match this symbol (contract-aware)
           setAccountPositions((prev) => {
             let updated = false
             const newPositions = prev.map((position) => {
               const positionSymbol = (position.symbol || '').toUpperCase()
               
-              // Check if this quote matches the position symbol
-              // Handle various formats: "MES" matches "MESZ25", "F.US.MES", etc.
-              const symbolMatches = 
-                positionSymbol === quoteSymbol ||
-                positionSymbol.includes(quoteSymbol) ||
-                quoteSymbol.includes(positionSymbol) ||
-                positionSymbol.replace(/[0-9]/g, '') === quoteSymbol.replace(/[0-9]/g, '')
+              // Check if this quote matches the position symbol with contract-aware matching
+              const symbolMatches = matchesSymbol(quoteSymbol, positionSymbol)
               
               if (!symbolMatches) {
                 return position
@@ -258,83 +381,7 @@ export default function TradingPage() {
     })
     
     return unsubscribe
-  }, [selectedAccountId])
-  
-  // Helper to get price multiplier from position metadata
-  const getPriceMultiplier = (position: any): number => {
-    const pointValue = typeof position?.point_value === 'number' && Number.isFinite(position.point_value)
-      ? position.point_value
-      : undefined
-    if (pointValue && pointValue !== 0) {
-      return pointValue
-    }
-
-    const tickValue = typeof position?.tick_value === 'number' && Number.isFinite(position.tick_value)
-      ? position.tick_value
-      : undefined
-    const tickSize = typeof position?.tick_size === 'number' && Number.isFinite(position.tick_size)
-      ? position.tick_size
-      : undefined
-
-    if (tickValue && tickSize && tickSize !== 0) {
-      return tickValue / tickSize
-    }
-
-    return 1
-  }
-
-  // Helper to normalize position data - prefer API-provided values, use correct multipliers
-  const normalizePosition = (position: any): Position => {
-    const sideLabel = (position.side || position.type || 'LONG').toString().toUpperCase().includes('SHORT') ? 'SHORT' : 'LONG'
-    const quantity = Number(position.quantity ?? position.size ?? 0) || 0
-    const entryPrice = Number(position.entry_price ?? position.averagePrice ?? position.price ?? 0) || 0
-    const currentPrice = Number(
-      position.current_price ??
-        position.marketPrice ??
-        position.lastPrice ??
-        entryPrice
-    )
-    
-    const direction = sideLabel === 'SHORT' ? -1 : 1
-    const priceMultiplier = getPriceMultiplier(position)
-    
-    // Use API-provided values when available, calculate only as fallback with correct multiplier
-    const entryValue = typeof position.entry_value === 'number' && Number.isFinite(position.entry_value)
-      ? position.entry_value
-      : entryPrice * Math.abs(quantity) * priceMultiplier
-    
-    const currentValue = typeof position.current_value === 'number' && Number.isFinite(position.current_value)
-      ? position.current_value
-      : currentPrice * Math.abs(quantity) * priceMultiplier
-    
-    const unrealized = typeof position.unrealized_pnl === 'number' && Number.isFinite(position.unrealized_pnl)
-      ? position.unrealized_pnl
-      : (currentPrice - entryPrice) * Math.abs(quantity) * priceMultiplier * direction
-    
-    const pnlPercent = typeof position.pnl_percent === 'number' && Number.isFinite(position.pnl_percent)
-      ? position.pnl_percent
-      : (entryValue ? (unrealized / entryValue) * 100 : 0)
-    
-    return {
-      position_id: position.position_id ?? position.id ?? undefined,
-      contract_id: position.contract_id,
-      symbol: position.symbol ?? position.contractId ?? '',
-      side: sideLabel,
-      quantity,
-      entry_price: entryPrice,
-      current_price: currentPrice,
-      entry_time: position.entry_time ?? position.creationTimestamp ?? position.timestamp,
-      account_id: position.account_id ?? position.accountId,
-      entry_value: entryValue,
-      current_value: currentValue,
-      unrealized_pnl: unrealized,
-      realized_pnl: typeof position.realized_pnl === 'number' ? position.realized_pnl : undefined,
-      pnl_percent: pnlPercent,
-      tick_size: typeof position.tick_size === 'number' ? position.tick_size : undefined,
-      tick_value: typeof position.tick_value === 'number' ? position.tick_value : undefined,
-      point_value: typeof position.point_value === 'number' ? position.point_value : undefined,
-    }
-  }
+  }, [selectedAccountId, matchesSymbol])
 
   const selectedAccount = useMemo(
     () => data?.projectx?.accounts.find((acct) => String(acct.id) === selectedAccountId),

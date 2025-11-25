@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
-import { createChart, IChartApi, CandlestickData, Time, ColorType, LineWidth } from 'lightweight-charts'
+import { createChart, IChartApi, CandlestickData, Time, ColorType, LineWidth, LineStyle } from 'lightweight-charts'
 import api from '@/lib/api'
 import { subscribeToWebSocketMessages } from '@/lib/websocket'
 import type { Position } from '@/types/dashboard'
@@ -150,13 +150,13 @@ export default function ProfessionalChart({
           vertLine: {
             color: '#3b82f6',
             width: 1,
-            style: 2, // Dashed
+            style: LineStyle.Dashed,
             labelBackgroundColor: '#3b82f6',
           },
           horzLine: {
             color: '#3b82f6',
             width: 1,
-            style: 2, // Dashed
+            style: LineStyle.Dashed,
             labelBackgroundColor: '#3b82f6',
           },
         },
@@ -352,7 +352,7 @@ export default function ProfessionalChart({
         price: entryPrice,
         color: color,
         lineWidth: 2 as LineWidth,
-        lineStyle: 2, // Dashed
+        lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
         title: `ENTRY ${position.side} ${position.quantity || 1} @ ${entryPrice.toFixed(2)}`,
       })
@@ -365,7 +365,7 @@ export default function ProfessionalChart({
           price: currentPriceForPnl,
           color: pnlColor,
           lineWidth: 1 as LineWidth,
-          lineStyle: 1, // Dotted
+          lineStyle: LineStyle.Dotted,
           axisLabelVisible: true,
           title: `P&L: ${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)`,
         })
@@ -406,7 +406,7 @@ export default function ProfessionalChart({
       price: currentPrice,
       color: priceColor,
       lineWidth: 2 as LineWidth, // Make it more visible
-      lineStyle: 2, // Dashed
+      lineStyle: LineStyle.Dashed,
       axisLabelVisible: true,
       title: `LIVE: ${currentPrice.toFixed(2)}`,
     })
