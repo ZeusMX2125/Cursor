@@ -55,9 +55,17 @@ export default function ALGOXAccountPanel({
         </button>
       </div>
 
-      {actionMessage && <div className="text-xs text-blue-500">{actionMessage}</div>}
+      {actionMessage && (
+        <div className={`text-xs p-2 rounded ${
+          actionMessage.includes('sent') || actionMessage.includes('success')
+            ? 'bg-green-500/20 text-green-400'
+            : 'bg-blue-500/20 text-blue-400'
+        }`}>
+          {actionMessage}
+        </div>
+      )}
 
-      <div className="space-y-3 max-h-[400px] overflow-auto">
+      <div className="space-y-3 max-h-[400px] overflow-y-auto pr-1">
         {accounts.map((account) => {
           const id = String(account.id)
           const isSelected = selectedAccountId === id
@@ -96,17 +104,17 @@ export default function ALGOXAccountPanel({
                 </div>
               </div>
 
-              <div className="flex gap-2">
+              <div className="flex gap-2 mt-2">
                 <button
                   onClick={() => onSelectAccount(id)}
-                  className="flex-1 px-2 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded font-semibold"
+                  className="flex-1 px-2 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded font-semibold transition-colors"
                 >
                   Select
                 </button>
                 <button
                   onClick={() => handleFlatten(id)}
                   disabled={flattening === id}
-                  className="flex-1 px-2 py-1.5 text-xs bg-[#1a1a1a] hover:bg-[#2a2a2a] border border-[#2a2a2a] text-white rounded font-semibold disabled:opacity-50"
+                  className="flex-1 px-2 py-1.5 text-xs bg-[#1a1a1a] hover:bg-[#2a2a2a] border border-[#2a2a2a] text-white rounded font-semibold disabled:opacity-50 transition-colors"
                 >
                   {flattening === id ? '...' : 'Flatten'}
                 </button>

@@ -1,10 +1,16 @@
-# CORS Error Fix Guide
+# CORS Configuration Guide
 
-## Problem
-You're seeing: `Access to XMLHttpRequest at 'http://localhost:8000/api/market/contracts?live=true' from origin 'http://localhost:3000' has been blocked by CORS policy`
+## Current CORS Setup
 
-## Root Cause
-The backend server needs to be **restarted** to apply the CORS middleware changes. The code is correct, but the running server doesn't have the new middleware.
+CORS is handled by FastAPI's `CORSMiddleware` with:
+- Default origins: `http://localhost:3000` and `http://127.0.0.1:3000`
+- Optional additional origins via `CORS_ALLOW_ORIGINS` environment variable
+- CORS headers automatically added to all responses (including errors)
+
+## How CORS Works in This Backend
+- The backend must be restarted after any CORS change.
+- The browser origin (e.g. `http://127.0.0.1:3000`) must appear in the backend’s allowed-origins list.
+- Error responses **must** include `Access-Control-Allow-Origin`; otherwise the browser treats them as CORS failures.
 
 ## Solution Steps
 
@@ -13,7 +19,7 @@ The backend server needs to be **restarted** to apply the CORS middleware change
 2. Press `Ctrl+C` to stop it
 3. Wait for it to fully stop
 
-### Step 2: Restart the Backend
+### Step 2: Restart the Backend (always required after CORS changes)
 ```bash
 cd backend
 uvicorn app:app --reload --host 0.0.0.0 --port 8000
@@ -25,33 +31,29 @@ cd backend
 python -m uvicorn app:app --reload
 ```
 
-### Step 3: Verify Backend is Running
-Open in browser: http://localhost:8000/api/test/cors
-
-You should see:
-```json
-{
-  "message": "CORS test successful",
-  "timestamp": "...",
-  "cors_configured": true
-}
+### Step 3: Run the automated CORS check
 ```
+cd backend
+python check_backend.py
+```
+The script calls `/`, `/api/test/cors`, `/api/market/contracts`, and `/health` with a localhost Origin header.  
+✅ **Pass** = every response (including errors) shows `Access-Control-Allow-Origin`.  
+❌ **Fail** = follow the script’s guidance (usually restart backend or add the origin).
 
-### Step 4: Check Browser Console
-1. Open http://localhost:3000/trading
-2. Open DevTools (F12)
-3. Check Network tab
-4. Look for `/api/market/contracts` request
-5. Check Response Headers - should include:
-   - `Access-Control-Allow-Origin: http://localhost:3000`
-   - `Access-Control-Allow-Credentials: true`
+### Step 4: Add extra origins when needed
+If the frontend runs from a different URL (e.g. `https://studio.localhost`), set:
+```
+# backend/.env
+CORS_ALLOW_ORIGINS=https://studio.localhost,http://localhost:3000
+```
+Restart the backend and rerun `python check_backend.py`.
 
-## What Was Fixed
+## What the backend now enforces
 
-1. **Added `EnsureCORSHeadersMiddleware`** - Guarantees CORS headers on ALL responses
-2. **Separated HTTPException handler** - Ensures error responses have CORS headers
-3. **Improved contracts endpoint** - Returns JSONResponse with CORS headers even on errors
-4. **Better error logging** - Frontend now shows detailed error messages
+1. **FastAPI CORSMiddleware** with sensible defaults (`http://localhost:3000`, `http://127.0.0.1:3000`) plus optional `CORS_ALLOW_ORIGINS` overrides.
+2. **Global response wrapper** that re-attaches `Access-Control-Allow-Origin` on every response, even when an exception occurs.
+3. **Unified exception handlers** so JSON errors are always returned (and now always have CORS headers).
+4. **`backend/check_backend.py`** so you can prove headers are present before opening the browser.
 
 ## If Still Not Working
 
@@ -63,9 +65,9 @@ Look for errors in the backend terminal. Common issues:
 
 ### Verify Backend is Actually Running
 ```bash
-# Test if backend responds
-curl http://localhost:8000/api/test/cors
+curl -i -H "Origin: http://localhost:3000" http://localhost:8000/api/cors-ok
 ```
+You should see `Access-Control-Allow-Origin: http://localhost:3000` in the headers even if the response is an error.
 
 ### Check Firewall
 Windows Firewall might be blocking port 8000. Temporarily disable to test.
@@ -80,10 +82,10 @@ TOPSTEPX_BASE_URL=https://api.topstepx.com/api
 
 ## Expected Behavior After Fix
 
-✅ No CORS errors in browser console
-✅ Contracts dropdown loads in trading page
-✅ All API calls work from frontend
-✅ WebSocket connects successfully (green indicator)
+✅ No CORS errors in browser console  
+✅ `/api/market/contracts` returns JSON (200/4xx/5xx) instead of “network error”  
+✅ Flatten button returns structured JSON (success or error)  
+✅ WebSocket connects (green indicator) once REST heartbeat succeeds
 
 ## Still Having Issues?
 

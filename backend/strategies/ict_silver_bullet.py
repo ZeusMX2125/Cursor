@@ -63,12 +63,24 @@ class ICTSilverBulletStrategy(BaseStrategy):
 
             # Detect displacement (3+ consecutive candles in same direction)
             recent_5 = bars.tail(5)
-            displacement_up = all(
-                recent_5["close"].tail(3) > recent_5["close"].shift(1).tail(3)
-            )
-            displacement_down = all(
-                recent_5["close"].tail(3) < recent_5["close"].shift(1).tail(3)
-            )
+            # Check if 3 most recent candles closed higher than previous 3 (simplistic displacement)
+            # Better check: consecutive bullish/bearish candles with large bodies
+            
+            closes = recent_5["close"]
+            opens = recent_5["open"]
+            
+            # Last 3 candles
+            c1 = closes[-1] > opens[-1]
+            c2 = closes[-2] > opens[-2]
+            c3 = closes[-3] > opens[-3]
+            
+            displacement_up = c1 and c2 and c3
+            
+            c1_down = closes[-1] < opens[-1]
+            c2_down = closes[-2] < opens[-2]
+            c3_down = closes[-3] < opens[-3]
+            
+            displacement_down = c1_down and c2_down and c3_down
 
             if not (displacement_up or displacement_down):
                 return None
@@ -78,14 +90,16 @@ class ICTSilverBulletStrategy(BaseStrategy):
             if not fvg:
                 return None
 
+            signal = None
+            
             # Determine direction
             if liquidity_swept_low and displacement_up and fvg["direction"] == "up":
                 # Bullish setup
                 entry_price = fvg["start"]
-                stop_loss = low_60m - 5  # 5 ticks below liquidity sweep
+                stop_loss = low_60m - 0.25 * 4 * 5 # 5 ticks below liquidity sweep (assuming 0.25 tick)
                 take_profit = entry_price + 2 * (entry_price - stop_loss)  # 2:1 R:R
 
-                return TradingSignal(
+                signal = TradingSignal(
                     symbol=symbol,
                     side="BUY",
                     entry_price=entry_price,
@@ -99,10 +113,10 @@ class ICTSilverBulletStrategy(BaseStrategy):
             elif liquidity_swept_high and displacement_down and fvg["direction"] == "down":
                 # Bearish setup
                 entry_price = fvg["start"]
-                stop_loss = high_60m + 5  # 5 ticks above liquidity sweep
+                stop_loss = high_60m + 0.25 * 4 * 5 # 5 ticks above liquidity sweep
                 take_profit = entry_price - 2 * (stop_loss - entry_price)  # 2:1 R:R
 
-                return TradingSignal(
+                signal = TradingSignal(
                     symbol=symbol,
                     side="SELL",
                     entry_price=entry_price,
@@ -112,6 +126,9 @@ class ICTSilverBulletStrategy(BaseStrategy):
                     confidence=0.8,
                     strategy_name=self.name,
                 )
+                
+            if signal:
+                return self.enrich_signal(signal, bars)
 
         except Exception as e:
             logger.error(f"Error in ICT Silver Bullet analysis: {e}", exc_info=True)
@@ -124,32 +141,39 @@ class ICTSilverBulletStrategy(BaseStrategy):
             return None
 
         # Get last 3 candles
-        c1 = bars.tail(3).head(1)
-        c2 = bars.tail(2).head(1)
-        c3 = bars.tail(1)
-
-        c1_high = c1["high"].item()
-        c1_low = c1["low"].item()
-        c2_high = c2["high"].item()
-        c2_low = c2["low"].item()
-        c3_high = c3["high"].item()
-        c3_low = c3["low"].item()
+        # c1 is 3rd to last (index -3), c2 is 2nd to last (index -2), c3 is last (index -1)
+        
+        # Need to ensure we are looking at the candles causing displacement
+        # Usually FVG is formed by the big move.
+        
+        c1_high = bars["high"][-3]
+        c1_low = bars["low"][-3]
+        c3_high = bars["high"][-1]
+        c3_low = bars["low"][-1]
 
         # Bullish FVG: c1 high < c3 low (gap between c1 and c3)
         if c1_high < c3_low:
             return {
                 "direction": "up",
-                "start": c1_high,
-                "end": c3_low,
+                "start": c1_high, # Entry at top of c1? No, usually entry is at retest of FVG which is between c1_high and c3_low.
+                # Standard ICT entry is at the "start" of the gap relative to price coming back?
+                # Price moves UP. Gap is c1_high to c3_low. Retest comes DOWN.
+                # So entry is c3_low (top of gap) or c1_high (bottom of gap)?
+                # Usually entry limit is placed at the "beginning" of the gap which is c3_low? No, that's immediate.
+                # Usually we wait for retracement into the gap.
+                # Limit entry at c3_low or even deeper (50%).
+                # Let's simplify: Limit at c3_low (top of gap) for aggressive, or c1_high + (c3_low-c1_high)/2 for conservative.
+                # Let's use Top of Gap (c3_low) to ensure fill if it touches.
+                "end": c3_low, # Actually start/end terminology is tricky.
+                "start": c3_low, # Limit Price
             }
 
         # Bearish FVG: c1 low > c3 high (gap between c1 and c3)
         if c1_low > c3_high:
             return {
                 "direction": "down",
-                "start": c1_low,
-                "end": c3_high,
+                "start": c3_high, # Limit Price (bottom of gap)
+                "end": c1_low,
             }
 
         return None
-

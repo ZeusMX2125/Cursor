@@ -33,8 +33,53 @@ export default function AccountSelector({ selectedAccount, onAccountChange }: Ac
   const fetchAccounts = async () => {
     try {
       setError(null)
-      const response = await api.get('/api/accounts')
-      setAccounts(response.data.accounts || [])
+      // Try ProjectX accounts first (from dashboard state)
+      const dashboardResponse = await api.get('/api/dashboard/state')
+      const projectxAccounts = dashboardResponse.data?.projectx?.accounts || []
+      
+      // Also try /api/accounts endpoint
+      let apiAccounts: any[] = []
+      try {
+        const accountsResponse = await api.get('/api/accounts')
+        apiAccounts = accountsResponse.data?.accounts || []
+      } catch (e) {
+        // Fallback if endpoint doesn't exist
+      }
+      
+      // Merge accounts, prioritizing ProjectX accounts
+      const allAccounts: Account[] = []
+      
+      // Add ProjectX accounts
+      projectxAccounts.forEach((acc: any) => {
+        allAccounts.push({
+          account_id: String(acc.id || acc.account_id || ''),
+          id: acc.id,
+          name: acc.name || acc.accountName || `Account ${acc.id}`,
+          accountName: acc.name || acc.accountName,
+          enabled: acc.canTrade !== false,
+          paper_trading: acc.simulated || false,
+        })
+      })
+      
+      // Add API accounts (avoid duplicates)
+      apiAccounts.forEach((acc: any) => {
+        const accountId = String(acc.account_id || acc.id || '')
+        if (!allAccounts.find(a => String(a.account_id) === accountId)) {
+          allAccounts.push({
+            account_id: accountId,
+            id: acc.id || acc.account_id,
+            name: acc.name || acc.accountName || `Account ${accountId}`,
+            accountName: acc.name || acc.accountName,
+            stage: acc.stage,
+            size: acc.size,
+            running: acc.running,
+            paper_trading: acc.paper_trading || acc.paperTrading,
+            enabled: acc.enabled !== false,
+          })
+        }
+      })
+      
+      setAccounts(allAccounts)
     } catch (error) {
       console.error('Error fetching accounts:', error)
       const message =

@@ -18,6 +18,7 @@ async def check_backend():
     
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        all_checks_passed = True
         # Test 1: Root endpoint
         print("1. Testing root endpoint (/)...")
         try:
@@ -54,8 +55,10 @@ async def check_backend():
                     print("   [OK] CORS is configured")
                 else:
                     print("   [X] CORS header missing!")
+                    all_checks_passed = False
         except Exception as e:
             print(f"   [X] ERROR: {e}")
+            all_checks_passed = False
         
         print()
         
@@ -69,15 +72,23 @@ async def check_backend():
                 print(f"   Status: {resp.status}")
                 cors_header = resp.headers.get("Access-Control-Allow-Origin")
                 print(f"   CORS Header: {cors_header or 'MISSING'}")
+                if not cors_header:
+                    print("   [X] Missing CORS header on contracts response!")
+                    all_checks_passed = False
                 if resp.status == 200:
                     data = await resp.json()
                     contract_count = len(data.get("contracts", []))
                     print(f"   [OK] Success! Found {contract_count} contracts")
+                elif resp.status >= 500:
+                    text = await resp.text()
+                    print(f"   [X] Backend error: {text[:200]}")
+                    all_checks_passed = False
                 else:
                     text = await resp.text()
-                    print(f"   [X] Error response: {text[:200]}")
+                    print(f"   [WARN] Non-200 response (expected during startup): {text[:200]}")
         except Exception as e:
             print(f"   [X] ERROR: {e}")
+            all_checks_passed = False
         
         print()
         
@@ -98,7 +109,7 @@ async def check_backend():
         print("Diagnostic complete!")
         print("=" * 60)
     
-    return True
+    return all_checks_passed
 
 if __name__ == "__main__":
     try:

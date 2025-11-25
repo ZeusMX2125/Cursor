@@ -21,11 +21,14 @@ export default function ALGOXQuickStrategies({ account, onRefresh }: ALGOXQuickS
     setSubmitting(true)
     setMessage(null)
     try {
-      await api.post(`/api/strategies/${account.account_id}/activate`, { strategy: strategyId })
-      setMessage(`Strategy ${strategyId} armed`)
+      await api.post(`/api/strategies/${account.account_id}/activate`, { 
+        strategy: strategyId,
+        action: 'activate'
+      })
+      setMessage(`Strategy ${strategyId} activated`)
       onRefresh()
     } catch (error: any) {
-      setMessage(error?.message ?? 'Unable to trigger strategy')
+      setMessage(error?.response?.data?.detail || error?.message || 'Unable to trigger strategy')
     } finally {
       setSubmitting(false)
     }
@@ -34,20 +37,28 @@ export default function ALGOXQuickStrategies({ account, onRefresh }: ALGOXQuickS
   return (
     <div className="bg-[#0a0a0a] border-b border-[#1a1a1a] p-4">
       <div className="mb-3">
-        <h3 className="text-sm font-semibold text-white mb-2">Quick Strategies</h3>
-        {message && <div className="text-xs text-blue-500 mb-2">{message}</div>}
-        <div className="flex gap-2">
+        <h3 className="text-sm font-semibold text-white mb-3">Quick Strategies</h3>
+        {message && (
+          <div className={`text-xs p-2 rounded mb-2 ${
+            message.includes('activated') || message.includes('success')
+              ? 'bg-green-500/20 text-green-400'
+              : 'bg-blue-500/20 text-blue-400'
+          }`}>
+            {message}
+          </div>
+        )}
+        <div className="flex gap-2.5">
           <button
             disabled={submitting}
             onClick={() => triggerStrategy('scalp_2_4')}
-            className="flex-1 px-3 py-2 bg-[#1a1a1a] hover:bg-[#2a2a2a] border border-[#2a2a2a] rounded text-xs font-semibold text-white disabled:opacity-50"
+            className="flex-1 px-3 py-2 bg-[#1a1a1a] hover:bg-[#2a2a2a] border border-[#2a2a2a] rounded text-xs font-semibold text-white disabled:opacity-50 transition-colors"
           >
             Scalp 2/4
           </button>
           <button
             disabled={submitting}
             onClick={() => triggerStrategy('breakout')}
-            className="flex-1 px-3 py-2 bg-[#1a1a1a] hover:bg-[#2a2a2a] border border-[#2a2a2a] rounded text-xs font-semibold text-white disabled:opacity-50"
+            className="flex-1 px-3 py-2 bg-[#1a1a1a] hover:bg-[#2a2a2a] border border-[#2a2a2a] rounded text-xs font-semibold text-white disabled:opacity-50 transition-colors"
           >
             Breakout
           </button>

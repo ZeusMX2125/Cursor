@@ -1,16 +1,34 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import api from '@/lib/api'
+import InstrumentSelector from '@/components/InstrumentSelector'
+import { useContracts } from '@/contexts/ContractsContext'
+import { formatSymbolForDisplay } from '@/lib/contractUtils'
+
 interface ALGOXOrderEntryProps {
   accountId?: string
   accountName?: string
   defaultSymbol: string
+  currentPrice?: number
   onOrderPlaced: () => void
 }
 
-export default function ALGOXOrderEntry({ accountId, accountName, defaultSymbol, onOrderPlaced }: ALGOXOrderEntryProps) {
+export default function ALGOXOrderEntry({ accountId, accountName, defaultSymbol, currentPrice, onOrderPlaced }: ALGOXOrderEntryProps) {
+  const { isValidSymbol, getContractBySymbol } = useContracts()
   const [symbol, setSymbol] = useState(defaultSymbol)
+  const [symbolError, setSymbolError] = useState<string | null>(null)
+  
+  // Sync symbol when defaultSymbol changes from parent
+  useEffect(() => {
+    if (defaultSymbol && isValidSymbol(defaultSymbol)) {
+      setSymbol(defaultSymbol)
+      setSymbolError(null)
+    }
+  }, [defaultSymbol, isValidSymbol])
+  
+  const contract = useMemo(() => getContractBySymbol(symbol), [symbol, getContractBySymbol])
+  const displaySymbol = useMemo(() => formatSymbolForDisplay(symbol, contract || undefined), [symbol, contract])
   const [orderType, setOrderType] = useState('Market')
   const [quantity, setQuantity] = useState(1)
   const [timeInForce, setTimeInForce] = useState('Day')
@@ -26,10 +44,16 @@ export default function ALGOXOrderEntry({ accountId, accountName, defaultSymbol,
       setMessage('Select an account to trade')
       return
     }
+    if (!symbol || !isValidSymbol(symbol)) {
+      setSymbolError('Invalid symbol. Please select a valid contract.')
+      setMessage('Invalid symbol')
+      return
+    }
+    setSymbolError(null)
     setSubmitting(true)
     setMessage(null)
     try {
-      await api.post('/api/trading/place-order', {
+      const response = await api.post('/api/trading/place-order', {
         account_id: Number(accountId),
         symbol,
         side,
@@ -39,7 +63,20 @@ export default function ALGOXOrderEntry({ accountId, accountName, defaultSymbol,
         stop_loss: bracketEnabled && stopLoss ? parseFloat(stopLoss) : undefined,
         take_profit: bracketEnabled && takeProfit ? parseFloat(takeProfit) : undefined,
       })
-      setMessage(`${side} order submitted`)
+      
+      // Check for market hours warning
+      const data = response.data || response
+      if (data.market_warning) {
+        setMessage(`${side} order submitted - ${data.market_warning}`)
+        // Show notification for closed hours
+        if (typeof window !== 'undefined') {
+          setTimeout(() => {
+            window.alert(data.market_warning)
+          }, 100)
+        }
+      } else {
+        setMessage(`${side} order submitted`)
+      }
       onOrderPlaced()
     } catch (error: any) {
       console.error('Order placement failed', error)
@@ -65,11 +102,11 @@ export default function ALGOXOrderEntry({ accountId, accountName, defaultSymbol,
   }
 
   return (
-    <div className="bg-[#0a0a0a] border-b border-[#1a1a1a] p-4 space-y-4">
+    <div className="bg-[#0a0a0a] border-b border-[#1a1a1a] p-4 space-y-4" suppressHydrationWarning>
       <div>
         <h3 className="text-sm font-semibold text-white mb-4">ORDER ENTRY</h3>
         
-        <div className="space-y-3">
+        <div className="space-y-3.5" suppressHydrationWarning>
           <div>
             <label className="block text-xs text-gray-400 mb-1">Account</label>
             <div className="w-full bg-[#1a1a1a] border border-[#2a2a2a] rounded px-2 py-1.5 text-sm text-white">
@@ -79,11 +116,25 @@ export default function ALGOXOrderEntry({ accountId, accountName, defaultSymbol,
 
           <div>
             <label className="block text-xs text-gray-400 mb-1">Contract</label>
-            <input
-              value={symbol}
-              onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-              className="w-full bg-[#1a1a1a] border border-[#2a2a2a] rounded px-2 py-1.5 text-sm text-white"
-            />
+            <div className="space-y-1">
+              <InstrumentSelector
+                value={symbol}
+                onChange={(newSymbol) => {
+                  setSymbol(newSymbol)
+                  setSymbolError(null)
+                }}
+                className="w-full"
+                disabled={submitting}
+              />
+              {symbolError && (
+                <div className="text-xs text-red-400">{symbolError}</div>
+              )}
+              {currentPrice && currentPrice > 0 && !symbolError && (
+                <div className="text-xs text-gray-400">
+                  {displaySymbol} @ {currentPrice.toFixed(2)}
+                </div>
+              )}
+            </div>
           </div>
 
           <div>
@@ -174,9 +225,17 @@ export default function ALGOXOrderEntry({ accountId, accountName, defaultSymbol,
             )}
           </div>
 
-          {message && <div className="text-xs text-blue-500">{message}</div>}
+          {message && (
+            <div className={`text-xs p-2 rounded ${
+              message.includes('submitted') || message.includes('sent')
+                ? 'bg-green-500/20 text-green-400'
+                : 'bg-blue-500/20 text-blue-400'
+            }`}>
+              {message}
+            </div>
+          )}
 
-          <div className="space-y-2 pt-2">
+          <div className="space-y-2.5 pt-3">
             <button
               onClick={() => submitOrder('BUY')}
               disabled={submitting}

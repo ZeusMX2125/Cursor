@@ -12,7 +12,7 @@ import { useDashboardData } from '@/hooks/useDashboardData'
 import { useSharedTradingState } from '@/hooks/useSharedTradingState'
 
 export default function DashboardPage() {
-  const { data: dashboardData, loading } = useDashboardData({ pollInterval: 5000 })
+  const { data: dashboardData, loading, error } = useDashboardData({ pollInterval: 5000 })
   const sharedState = useSharedTradingState()
 
   // Calculate aggregate stats from dashboard data
@@ -48,7 +48,14 @@ export default function DashboardPage() {
           </div>
 
           {loading && !dashboardData ? (
-            <div className="text-center py-8 text-dark-text-muted">Loading dashboard data...</div>
+            <div className="text-center py-8 text-dark-text-muted">
+              <div className="animate-pulse">Loading dashboard data...</div>
+            </div>
+          ) : error ? (
+            <div className="bg-red-500/20 border border-red-500/40 rounded-lg p-4 text-red-400">
+              <div className="font-semibold mb-2">Error loading dashboard</div>
+              <div className="text-sm">{error}</div>
+            </div>
           ) : (
             <>
               <StatsCards
@@ -59,7 +66,7 @@ export default function DashboardPage() {
               />
 
               <div className="grid grid-cols-2 gap-6 mt-6">
-                <PriceChart symbol="ES" />
+                <PriceChart />
                 <OrderEntry />
               </div>
 

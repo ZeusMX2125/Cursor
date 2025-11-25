@@ -12,6 +12,9 @@ export interface Position {
   entry_value?: number
   current_value?: number
   pnl_percent?: number
+  tick_size?: number
+  tick_value?: number
+  point_value?: number
   account_id?: string
   entry_time?: string
 }

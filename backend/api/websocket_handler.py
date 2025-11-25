@@ -85,13 +85,30 @@ class WebSocketHandler:
         return payload
 
     def _extract_symbol(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Extract symbol from payload, handling various formats.
+        
+        Formats handled:
+        - Direct symbol: "MES", "MNQ"
+        - Symbol ID: "F.US.MES", "F.US.EP" 
+        - Contract ID: "CON.F.US.MES.H25" -> extracts "MES"
+        """
         symbol = payload.get("symbol") or payload.get("symbolId")
+        
+        # If symbol is in format "F.US.MES" or "F.US.EP", extract the last part
+        if isinstance(symbol, str) and "." in symbol:
+            parts = symbol.split(".")
+            # For "F.US.MES" format, take last part
+            if len(parts) >= 3 and parts[0] == "F" and parts[1] == "US":
+                symbol = parts[-1]  # Get last part (MES, EP, etc.)
+        
         if not symbol:
             contract_id = payload.get("contractId") or payload.get("id")
             if isinstance(contract_id, str) and "." in contract_id:
                 parts = contract_id.split(".")
+                # Contract format: "CON.F.US.MES.H25" -> extract "MES" (index 3)
                 if len(parts) >= 4:
                     symbol = parts[3]
+        
         if isinstance(symbol, str):
             return symbol.upper()
         return None
@@ -107,7 +124,13 @@ class WebSocketHandler:
             or payload.get("askPrice")
         )
         if symbol and isinstance(price, (int, float)):
-            self._latest_quotes[symbol] = float(price)
+            price_float = float(price)
+            self._latest_quotes[symbol] = price_float
+            # Also update the API client's quote cache if available
+            if self.api_client:
+                self.api_client.update_quote(symbol, price_float)
+            # Log quote updates for debugging (can be removed in production)
+            logger.debug(f"Quote update: {symbol} = {price_float}")
 
         normalized.update(
             {
@@ -121,12 +144,20 @@ class WebSocketHandler:
         return normalized
 
     def _normalize_position_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize position payload structure without calculating P&L.
+        
+        P&L calculation requires contract metadata (tick_value, point_value) which is not
+        available in WebSocket payloads. Let projectx_service handle P&L calculations.
+        This method only normalizes the structure and updates current_price from cached quotes.
+        """
         normalized = dict(payload or {})
         symbol = self._extract_symbol(payload)
         side_code = payload.get("type") or payload.get("side") or 1
         side = "LONG" if int(side_code) == 1 else "SHORT"
         quantity = float(payload.get("size") or payload.get("quantity") or 0)
         entry_price = float(payload.get("averagePrice") or payload.get("entryPrice") or payload.get("price") or 0.0)
+        
+        # Get current price from payload or cached quotes
         current_price = float(
             payload.get("marketPrice")
             or payload.get("markPrice")
@@ -135,17 +166,11 @@ class WebSocketHandler:
             or entry_price
         )
 
-        entry_value = entry_price * abs(quantity)
-        direction = 1 if side == "LONG" else -1
+        # Pass through API-provided P&L if available (though typically not in position updates)
+        unrealized_from_api = payload.get("floatingProfitLoss") or payload.get("profitAndLoss") or payload.get("unrealizedPnL")
+        realized_from_api = payload.get("realizedProfitLoss") or payload.get("realizedPnL")
 
-        unrealized = payload.get("floatingProfitLoss") or payload.get("profitAndLoss") or payload.get("unrealizedPnL")
-        if isinstance(unrealized, (int, float)):
-            unrealized_value = float(unrealized)
-        else:
-            unrealized_value = (current_price - entry_price) * abs(quantity) * direction
-
-        pnl_percent = (unrealized_value / entry_value * 100) if entry_value else 0.0
-
+        # Build normalized position - do NOT calculate P&L without contract metadata
         normalized.update(
             {
                 "position_id": payload.get("id") or payload.get("positionId"),
@@ -154,18 +179,17 @@ class WebSocketHandler:
                 "quantity": quantity,
                 "entry_price": entry_price,
                 "current_price": current_price,
-                "entry_value": entry_value,
-                "current_value": current_price * abs(quantity),
-                "unrealized_pnl": unrealized_value,
-                "pnl_percent": pnl_percent,
                 "account_id": payload.get("accountId") or payload.get("account_id"),
                 "entry_time": payload.get("creationTimestamp") or payload.get("openTimestamp") or payload.get("timestamp"),
             }
         )
-
-        realized = payload.get("realizedProfitLoss") or payload.get("realizedPnL")
-        if isinstance(realized, (int, float)):
-            normalized["realized_pnl"] = float(realized)
+        
+        # Only include P&L if API provided it (pass through, don't calculate)
+        if unrealized_from_api is not None and isinstance(unrealized_from_api, (int, float)):
+            normalized["unrealized_pnl"] = float(unrealized_from_api)
+        
+        if realized_from_api is not None and isinstance(realized_from_api, (int, float)):
+            normalized["realized_pnl"] = float(realized_from_api)
 
         return normalized
 
@@ -216,6 +240,9 @@ class WebSocketHandler:
                     self._reconnect_event.clear()
             except Exception as exc:  # pragma: no cover
                 logger.error(f"Realtime connection error: {exc}", exc_info=True)
+                # Don't reconnect if we're explicitly stopped
+                if not self.running:
+                    break
             finally:
                 await self._stop_connections()
 
@@ -224,6 +251,9 @@ class WebSocketHandler:
                 logger.info(f"Reconnecting to ProjectX SignalR in {sleep_time} seconds")
                 await asyncio.sleep(sleep_time)
                 backoff = min(backoff * 2, self.settings.websocket_max_reconnect_delay)
+            else:
+                # If we're not running, break out of the loop
+                break
 
     async def _start_connections(self, token: str) -> None:
         """Start both user and market hub connections."""
@@ -307,7 +337,7 @@ class WebSocketHandler:
 
     async def _subscribe(self) -> None:
         """Subscribe to realtime channels after connection is open."""
-        if not self.user_connection:
+        if not self.user_connection or not self.market_connection:
             return
 
         self.user_connection.send("SubscribeAccounts", [])
@@ -316,6 +346,11 @@ class WebSocketHandler:
         if account_id:
             for method in ("SubscribeOrders", "SubscribePositions", "SubscribeTrades"):
                 self.user_connection.send(method, [account_id])
+        
+        # Subscribe to quotes for common trading symbols
+        # The market hub broadcasts quotes for all active symbols, but we can also
+        # explicitly subscribe if needed. For now, GatewayQuote events come automatically
+        # from the market hub for all active symbols.
 
     async def _stop_connections(self) -> None:
         """Tear down hub connections."""

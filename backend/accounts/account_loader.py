@@ -113,3 +113,69 @@ def _create_default_accounts() -> Dict[str, AccountConfig]:
 
     return {"default_50k": default_account}
 
+
+async def add_account_to_config(
+    account_data: dict,
+    config_path: str = "config/accounts.yaml"
+) -> bool:
+    """Add or update an account in the YAML configuration file."""
+    import yaml
+    from pathlib import Path
+    
+    try:
+        config_file = _resolve_config_file(config_path)
+    except FileNotFoundError:
+        # File doesn't exist, create it
+        project_root = Path(__file__).resolve().parents[2]
+        config_file = project_root / config_path
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        # Create initial structure
+        with open(config_file, "w") as f:
+            yaml.dump({"accounts": []}, f, default_flow_style=False, sort_keys=False)
+    
+    # Read existing data
+    with open(config_file, "r") as f:
+        data = yaml.safe_load(f) or {}
+    
+    if "accounts" not in data:
+        data["accounts"] = []
+    
+    # Check if account already exists
+    account_id = account_data.get("account_id")
+    existing_index = None
+    for i, acc in enumerate(data["accounts"]):
+        if acc.get("account_id") == account_id:
+            existing_index = i
+            break
+    
+    # Prepare account entry (only include username/api_key if provided)
+    account_entry = {
+        "account_id": account_data["account_id"],
+        "name": account_data["name"],
+        "stage": account_data["stage"],
+        "size": account_data["size"],
+        "enabled_strategies": account_data.get("enabled_strategies", ["ict_silver_bullet"]),
+        "ai_agent_type": account_data.get("ai_agent_type", "rule_based"),
+        "paper_trading": account_data.get("paper_trading", True),
+        "enabled": account_data.get("enabled", True),
+    }
+    
+    # Only add username/api_key if they're provided
+    if account_data.get("username"):
+        account_entry["username"] = account_data["username"]
+    if account_data.get("api_key"):
+        account_entry["api_key"] = account_data["api_key"]
+    
+    # Update or add account
+    if existing_index is not None:
+        data["accounts"][existing_index] = account_entry
+        logger.info(f"Updated account {account_id} in {config_path}")
+    else:
+        data["accounts"].append(account_entry)
+        logger.info(f"Added account {account_id} to {config_path}")
+    
+    # Write back to file
+    with open(config_file, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    
+    return True

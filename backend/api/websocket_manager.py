@@ -43,14 +43,21 @@ class WebSocketManager:
         for connection in connections:
             try:
                 await connection.send_text(message_json)
+            except (RuntimeError, ConnectionError, OSError) as e:
+                # Connection is closed or broken - remove it silently
+                logger.debug(f"WebSocket client disconnected during broadcast: {type(e).__name__}")
+                disconnected.add(connection)
             except Exception as e:
-                logger.warning(f"Error sending to WebSocket client: {e}")
+                # Other errors - log but still remove connection
+                logger.debug(f"WebSocket error during broadcast: {type(e).__name__}: {e}")
                 disconnected.add(connection)
 
         # Remove disconnected clients
         if disconnected:
             async with self._lock:
                 self.active_connections -= disconnected
+                if disconnected:
+                    logger.debug(f"Removed {len(disconnected)} disconnected WebSocket clients")
 
     async def send_personal_message(self, message: Dict, websocket: WebSocket) -> None:
         """Send a message to a specific client."""

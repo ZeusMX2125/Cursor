@@ -1,19 +1,33 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import Sidebar from '@/components/Sidebar'
 import Header from '@/components/Header'
 import AccountSelector from '@/components/AccountSelector'
 import { useDashboardData } from '@/hooks/useDashboardData'
 import { useSharedTradingState } from '@/hooks/useSharedTradingState'
+import { useContracts } from '@/contexts/ContractsContext'
 import api from '@/lib/api'
 
 export default function AnalyticsPage() {
   const { data: dashboardData } = useDashboardData({ pollInterval: 10000 })
   const sharedState = useSharedTradingState()
+  const { contracts, isValidSymbol } = useContracts()
   const [selectedAccount, setSelectedAccount] = useState<string | null>(null)
   const [backtestRunning, setBacktestRunning] = useState(false)
   const [backtestResults, setBacktestResults] = useState<any>(null)
+  const [startDate, setStartDate] = useState(
+    new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+  )
+  const [endDate, setEndDate] = useState(new Date().toISOString().split('T')[0])
+  const [timeframe, setTimeframe] = useState('5m')
+  const [selectedSymbols, setSelectedSymbols] = useState<string[]>([])
+  const [error, setError] = useState<string | null>(null)
+
+  // Get available symbols from contracts
+  const availableSymbols = useMemo(() => {
+    return contracts.map(c => c.symbol || '').filter(Boolean)
+  }, [contracts])
 
   const totalBalance =
     sharedState.accountBalance ||
@@ -22,24 +36,38 @@ export default function AnalyticsPage() {
 
   const handleRunBacktest = async () => {
     if (!selectedAccount) {
-      alert('Please select an account')
+      setError('Please select an account')
+      return
+    }
+
+    if (selectedSymbols.length === 0) {
+      setError('Please select at least one symbol')
+      return
+    }
+
+    // Validate all selected symbols
+    const invalidSymbols = selectedSymbols.filter(s => !isValidSymbol(s))
+    if (invalidSymbols.length > 0) {
+      setError(`Invalid symbols: ${invalidSymbols.join(', ')}`)
       return
     }
 
     setBacktestRunning(true)
+    setError(null)
+    setBacktestResults(null)
     try {
       const response = await api.post('/api/backtest/run', {
         account_ids: [selectedAccount],
-        symbols: ['MNQ', 'MES', 'MGC'],
-        timeframe: '5m',
-        start_date: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-        end_date: new Date().toISOString().split('T')[0],
+        symbols: selectedSymbols,
+        timeframe,
+        start_date: startDate,
+        end_date: endDate,
       })
 
-      setBacktestResults(response.data.results)
-    } catch (error) {
-      console.error('Error running backtest:', error)
-      alert('Error running backtest')
+      setBacktestResults(response.data.results || response.data)
+    } catch (err: any) {
+      console.error('Error running backtest:', err)
+      setError(err?.response?.data?.detail || err?.message || 'Error running backtest')
     } finally {
       setBacktestRunning(false)
     }
@@ -66,12 +94,49 @@ export default function AnalyticsPage() {
               onAccountChange={setSelectedAccount}
             />
 
+            {error && (
+              <div className="mb-4 p-3 bg-red-500/20 text-red-400 rounded-lg text-sm">
+                {error}
+              </div>
+            )}
+
+            <div className="mb-4">
+              <label className="block text-sm mb-2">Symbols (select from available contracts)</label>
+              <div className="space-y-2">
+                <div className="flex flex-wrap gap-2">
+                  {availableSymbols.map((sym) => (
+                    <label key={sym} className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedSymbols.includes(sym)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedSymbols([...selectedSymbols, sym])
+                          } else {
+                            setSelectedSymbols(selectedSymbols.filter(s => s !== sym))
+                          }
+                        }}
+                        className="rounded"
+                      />
+                      <span className="text-sm">{sym}</span>
+                    </label>
+                  ))}
+                </div>
+                {selectedSymbols.length > 0 && (
+                  <div className="text-xs text-gray-400">
+                    Selected: {selectedSymbols.join(', ')}
+                  </div>
+                )}
+              </div>
+            </div>
+
             <div className="grid grid-cols-2 gap-4 mb-4">
               <div>
                 <label className="block text-sm mb-2">Start Date</label>
                 <input
                   type="date"
-                  defaultValue={new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]}
+                  value={startDate}
+                  onChange={(e) => setStartDate(e.target.value)}
                   className="w-full bg-dark-bg border border-dark-border rounded px-3 py-2"
                 />
               </div>
@@ -79,7 +144,8 @@ export default function AnalyticsPage() {
                 <label className="block text-sm mb-2">End Date</label>
                 <input
                   type="date"
-                  defaultValue={new Date().toISOString().split('T')[0]}
+                  value={endDate}
+                  onChange={(e) => setEndDate(e.target.value)}
                   className="w-full bg-dark-bg border border-dark-border rounded px-3 py-2"
                 />
               </div>
@@ -87,18 +153,24 @@ export default function AnalyticsPage() {
 
             <div className="mb-4">
               <label className="block text-sm mb-2">Timeframe</label>
-              <select className="w-full bg-dark-bg border border-dark-border rounded px-3 py-2">
+              <select
+                value={timeframe}
+                onChange={(e) => setTimeframe(e.target.value)}
+                className="w-full bg-dark-bg border border-dark-border rounded px-3 py-2"
+              >
                 <option value="1m">1 Minute</option>
-                <option value="5m" selected>5 Minute</option>
+                <option value="5m">5 Minute</option>
                 <option value="15m">15 Minute</option>
                 <option value="1h">1 Hour</option>
+                <option value="4h">4 Hour</option>
+                <option value="1d">1 Day</option>
               </select>
             </div>
 
             <button
               onClick={handleRunBacktest}
               disabled={backtestRunning || !selectedAccount}
-              className="px-4 py-2 bg-primary hover:bg-primary-hover rounded-lg disabled:opacity-50"
+              className="px-4 py-2 bg-primary hover:bg-primary-hover rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {backtestRunning ? 'Running Backtest...' : 'Run Deep Backtest'}
             </button>

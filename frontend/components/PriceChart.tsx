@@ -1,9 +1,11 @@
 'use client'
 
+import { useEffect, useState } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
+import { useContracts } from '@/contexts/ContractsContext'
 
 interface PriceChartProps {
-  symbol: string
+  symbol?: string
 }
 
 // Mock data - replace with real data from WebSocket
@@ -21,13 +23,36 @@ const mockData = [
   { time: '10:20', price: 4165 },
 ]
 
-export default function PriceChart({ symbol }: PriceChartProps) {
+export default function PriceChart({ symbol: propSymbol }: PriceChartProps) {
+  const { contracts, getFirstContract, loading: contractsLoading } = useContracts()
+  const [symbol, setSymbol] = useState<string>(propSymbol || '')
+
+  // Initialize symbol from first available ProjectX contract if not provided
+  useEffect(() => {
+    if (!contractsLoading && contracts.length > 0 && !symbol && !propSymbol) {
+      const firstContract = getFirstContract()
+      if (firstContract?.symbol) {
+        setSymbol(firstContract.symbol)
+      }
+    } else if (propSymbol) {
+      setSymbol(propSymbol)
+    }
+  }, [contractsLoading, contracts, symbol, propSymbol, getFirstContract])
+
+  if (!symbol && !contractsLoading) {
+    return (
+      <div className="bg-dark-card p-4 rounded-lg border border-dark-border">
+        <div className="text-sm text-dark-text-muted">No contract available</div>
+      </div>
+    )
+  }
+
   return (
     <div className="bg-dark-card p-4 rounded-lg border border-dark-border">
       <div className="flex justify-between items-center mb-4">
         <div>
-          <div className="text-lg font-semibold">{symbol}</div>
-          <div className="text-xs text-dark-text-muted">S&P 500 E-Mini</div>
+          <div className="text-lg font-semibold">{symbol || 'Loading...'}</div>
+          <div className="text-xs text-dark-text-muted">Price Chart</div>
         </div>
         <div className="flex gap-2">
           {['1m', '5m', '15m', '1h'].map((tf) => (

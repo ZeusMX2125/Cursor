@@ -10,6 +10,7 @@ from api.topstepx_client import TopstepXClient
 from config.settings import Settings
 from core.position_tracker import PositionTracker
 from risk.risk_manager import RiskManager
+from ml.rl_agent import RLAgent
 
 
 class Order:
@@ -48,24 +49,36 @@ class OrderManager:
         api_client: TopstepXClient,
         risk_manager: RiskManager,
         position_tracker: PositionTracker,
+        rl_agent: Optional[RLAgent] = None,
     ):
         self.settings = settings
         self.api_client = api_client
         self.risk_manager = risk_manager
         self.position_tracker = position_tracker
+        self.rl_agent = rl_agent
         self.orders: Dict[str, Order] = {}
         self._lock = asyncio.Lock()
 
-    async def execute_signal(self, signal: Dict) -> Optional[str]:
+    async def execute_signal(self, signal: Dict, skip_risk_check: bool = False) -> Optional[str]:
         """Execute a trading signal."""
         try:
             # Check risk before executing
-            if not await self.risk_manager.check_trade_risk(signal):
+            if not skip_risk_check and not await self.risk_manager.check_trade_risk(signal):
                 logger.warning(f"Signal rejected by risk manager: {signal}")
                 return None
 
             # Calculate position size
+            # Use RL agent if available
+            rl_quantity = None
+            if self.rl_agent and self.rl_agent.enabled:
+                # Construct state from signal metadata if available or fetch
+                # For now, we use a placeholder or signal confidence
+                # In real implementation, we'd pass full market state
+                pass
+            
+            # Default risk manager sizing
             quantity = await self.risk_manager.calculate_position_size(signal)
+            
             if quantity <= 0:
                 logger.warning(f"Invalid position size: {quantity}")
                 return None
@@ -187,4 +200,3 @@ class OrderManager:
     def get_all_orders(self) -> List[Order]:
         """Get all orders."""
         return list(self.orders.values())
-

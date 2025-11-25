@@ -1,7 +1,25 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useMemo } from 'react'
 import type { ReactNode } from 'react'
+
+// Helper function to format symbol for display (convert ES to MES for micro contracts)
+function formatSymbolForDisplay(symbol: string): string {
+  const upperSymbol = symbol.toUpperCase()
+  // If symbol already starts with MES, return as is
+  if (upperSymbol.startsWith('MES')) {
+    return upperSymbol
+  }
+  // If symbol starts with ES and is a micro contract (typically has month code), show as MES
+  if (upperSymbol.startsWith('ES') && upperSymbol.length >= 4) {
+    // Check if it's likely a micro contract (has month/year codes like Z25, H26, etc.)
+    const monthCode = upperSymbol.charAt(2)
+    if (monthCode && /[FGHJKMNQUVXZ]/.test(monthCode)) {
+      return 'M' + upperSymbol
+    }
+  }
+  return upperSymbol
+}
 
 interface TopBarProps {
   symbol: string
@@ -53,6 +71,8 @@ export default function TopBar({
   onSymbolChange,
   instrumentSelector,
 }: TopBarProps) {
+  const displaySymbol = useMemo(() => formatSymbolForDisplay(symbol), [symbol])
+  
   return (
     <div className="h-12 bg-[#0a0a0a] border-b border-[#1a1a1a] px-4 flex items-center justify-between">
       <div className="flex items-center gap-6">
@@ -66,7 +86,7 @@ export default function TopBar({
           </div>
         ) : (
           <div className="text-sm text-gray-300 font-medium">
-            {symbol} {instrumentName ? `- ${instrumentName}` : ''}
+            {displaySymbol} {instrumentName ? `- ${instrumentName}` : ''}
           </div>
         )}
       </div>

@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import api from '@/lib/api'
 import Sidebar from '@/components/Sidebar'
 import Header from '@/components/Header'
 import AccountSelector from '@/components/AccountSelector'
@@ -30,14 +31,59 @@ export default function BotConfigPage() {
     trailingStop: 12,
   })
 
+  const [saving, setSaving] = useState(false)
+  const [starting, setStarting] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+
   const handleSave = async () => {
-    // TODO: Implement API call to save config
-    console.log('Saving config:', config)
+    if (!selectedAccount) {
+      setMessage('Please select an account first')
+      return
+    }
+    setSaving(true)
+    setMessage(null)
+    try {
+      await api.post('/api/config/save', {
+        account_id: selectedAccount,
+        strategy_settings: {
+          strategy_type: config.strategyType,
+          timeframe: config.timeframe,
+          contracts: config.contracts,
+          long_entries: config.longEntries,
+          short_entries: config.shortEntries,
+        },
+        risk_settings: {
+          max_daily_loss: config.maxDailyLoss,
+          daily_profit_target: config.dailyProfitTarget,
+          max_drawdown: config.maxDrawdown,
+          trailing_stop: config.trailingStop,
+        }
+      })
+      setMessage('Configuration saved successfully')
+    } catch (error: any) {
+      setMessage(error?.response?.data?.detail || error?.message || 'Failed to save config')
+    } finally {
+      setSaving(false)
+    }
   }
 
   const handleStart = async () => {
-    // TODO: Implement API call to start engine
-    console.log('Starting engine')
+    if (!selectedAccount) {
+      setMessage('Please select an account first')
+      return
+    }
+    setStarting(true)
+    setMessage(null)
+    try {
+      // First save config, then start
+      await handleSave()
+      await api.post(`/api/accounts/${selectedAccount}/start`)
+      setMessage('Engine started successfully')
+    } catch (error: any) {
+      setMessage(error?.response?.data?.detail || error?.message || 'Failed to start engine')
+    } finally {
+      setStarting(false)
+    }
   }
 
   return (
@@ -63,18 +109,27 @@ export default function BotConfigPage() {
               selectedAccount={selectedAccount}
               onAccountChange={setSelectedAccount}
             />
+            {message && (
+              <div className={`mb-4 p-3 rounded-lg text-sm ${
+                message.includes('success') ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+              }`}>
+                {message}
+              </div>
+            )}
             <div className="flex gap-4">
               <button
                 onClick={handleSave}
-                className="px-4 py-2 bg-primary hover:bg-primary-hover rounded-lg flex items-center gap-2"
+                disabled={saving || !selectedAccount}
+                className="px-4 py-2 bg-primary hover:bg-primary-hover rounded-lg flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <span>💾</span> Save Config
+                <span>💾</span> {saving ? 'Saving...' : 'Save Config'}
               </button>
               <button
                 onClick={handleStart}
-                className="px-4 py-2 bg-success hover:bg-success/80 rounded-lg flex items-center gap-2"
+                disabled={starting || !selectedAccount}
+                className="px-4 py-2 bg-success hover:bg-success/80 rounded-lg flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <span>▶️</span> Start Engine
+                <span>▶️</span> {starting ? 'Starting...' : 'Start Engine'}
               </button>
             </div>
           </div>

@@ -1,4 +1,10 @@
-"""TopstepX REST API client with rate limiting."""
+"""TopstepX REST API client with rate limiting.
+
+NOTE: This is the V1 client using exception-based error handling.
+V2 client (topstepx_client_v2.py) uses Result-based error handling.
+Both are currently active - V1 is used by legacy code, V2 by newer endpoints.
+Consider migrating all code to V2 for consistent error handling.
+"""
 
 import asyncio
 import time
@@ -61,6 +67,7 @@ class TopstepXClient:
         self.general_limiter = RateLimiter(200, 60)  # 200 req/60s
         self._instrument_cache: Dict[str, Dict[str, Any]] = {}
         self._default_account_id: Optional[int] = None
+        self._latest_quotes: Dict[str, float] = {}  # Cache for current market prices
 
     async def initialize(self) -> None:
         """Initialize the HTTP session."""
@@ -129,10 +136,17 @@ class TopstepXClient:
                     # Handle 4xx client errors
                     if 400 <= response.status < 500:
                         error_text = await response.text()
-                        logger.error(
-                            f"Client error {response.status} on {method} {endpoint}. "
-                            f"Response: {error_text[:500]}"
-                        )
+                        # 404 errors are expected for endpoints that don't exist - log as warning, not error
+                        if response.status == 404:
+                            logger.warning(
+                                f"Endpoint not found (404) on {method} {endpoint}. "
+                                f"This may be expected if the endpoint doesn't exist. Response: {error_text[:200]}"
+                            )
+                        else:
+                            logger.error(
+                                f"Client error {response.status} on {method} {endpoint}. "
+                                f"Response: {error_text[:500]}"
+                            )
                         # Try to parse JSON error response
                         try:
                             error_json = await response.json()
@@ -390,6 +404,15 @@ class TopstepXClient:
 
     # Position Methods
 
+    def update_quote(self, symbol: str, price: float) -> None:
+        """Update cached quote for a symbol."""
+        if symbol:
+            self._latest_quotes[symbol.upper()] = float(price)
+
+    def get_cached_quote(self, symbol: str) -> Optional[float]:
+        """Get cached quote for a symbol."""
+        return self._latest_quotes.get(symbol.upper()) if symbol else None
+
     async def get_open_positions(
         self, account_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
@@ -413,39 +436,53 @@ class TopstepXClient:
             contract_id = pos.get("contractId", "")
             symbol = contract_id.split(".")[3] if "." in contract_id and len(contract_id.split(".")) >= 4 else contract_id
             direction = pos.get("type", 1)
+            entry_price = float(pos.get("averagePrice", 0.0))
+            quantity = int(pos.get("size", 0))
+            
+            # Get current price from API response, cached quotes, or fallback to entry price
             current_price = (
                 pos.get("marketPrice")
                 or pos.get("lastPrice")
                 or pos.get("currentPrice")
                 or pos.get("markPrice")
-                or pos.get("averagePrice")
             )
-            unrealized = (
+            if current_price is None:
+                # Try to get from cached quotes
+                cached_price = self.get_cached_quote(symbol)
+                current_price = cached_price if cached_price is not None else entry_price
+            else:
+                current_price = float(current_price)
+            
+            # Determine side from direction code
+            side = "LONG" if direction == 1 else "SHORT"
+            
+            # Check if API provided P&L (though it typically doesn't for open positions)
+            # If provided, pass it through; otherwise leave as None for projectx_service to calculate
+            unrealized_from_api = (
                 pos.get("profitAndLoss")
                 or pos.get("unrealizedPnL")
                 or pos.get("floatingProfitLoss")
                 or pos.get("floatingPnL")
             )
-            realized = pos.get("realizedPnL") or pos.get("realizedProfitLoss")
-            entry_price = pos.get("averagePrice", 0.0)
-            quantity = pos.get("size", 0)
-            entry_value = entry_price * abs(quantity) if entry_price and quantity else 0.0
-            current_value = current_price * abs(quantity) if current_price and quantity else 0.0
+            unrealized_pnl = float(unrealized_from_api) if unrealized_from_api is not None and isinstance(unrealized_from_api, (int, float)) else None
             
+            # Realized P&L is not available in position response - it comes from closed trades
+            realized_pnl = None
+            
+            # Return raw position data - let projectx_service calculate P&L with contract metadata
+            # Do NOT calculate entry_value, current_value, or P&L here without multipliers
             formatted.append(
                 {
                     "position_id": position_id,
                     "contract_id": contract_id,
                     "symbol": symbol,
-                    "side": "LONG" if direction == 1 else "SHORT",
+                    "side": side,
                     "quantity": quantity,
                     "entry_price": entry_price,
                     "account_id": resolved_account,
                     "current_price": current_price,
-                    "entry_value": entry_value,
-                    "current_value": current_value,
-                    "unrealized_pnl": unrealized if unrealized is not None else 0.0,
-                    "realized_pnl": realized if realized is not None else 0.0,
+                    "unrealized_pnl": unrealized_pnl,  # Pass through API value if available, None otherwise
+                    "realized_pnl": realized_pnl,  # Will be None for open positions
                     "entry_time": pos.get("creationTimestamp") or pos.get("openTimestamp"),
                 }
             )
@@ -549,10 +586,63 @@ class TopstepXClient:
     async def list_available_contracts(self, live: bool = True) -> List[Dict[str, Any]]:
         """Return the list of tradable contracts."""
         payload = {"live": live}
+        logger.info(f"Requesting contracts from ProjectX API with payload: {payload}")
         response = await self._request("POST", "/Contract/available", json=payload)
-        if isinstance(response, dict) and response.get("success"):
-            return response.get("contracts", [])
-        return []
+        
+        # Handle response according to ProjectX API format
+        if not isinstance(response, dict):
+            logger.error(f"Unexpected response type from Contract/available: {type(response)}, value={response}")
+            return []
+        
+        # Log full response for debugging
+        logger.info(f"Contract/available API response: success={response.get('success')}, errorCode={response.get('errorCode')}, contracts_count={len(response.get('contracts', []))}")
+        
+        # Check for success flag
+        success = response.get("success", False)
+        error_code = response.get("errorCode", 0)
+        error_message = response.get("errorMessage")
+        
+        if not success or error_code != 0:
+            logger.error(
+                f"Contract/available API returned error: code={error_code}, "
+                f"message={error_message}, full_response={response}"
+            )
+            return []
+        
+        # Extract contracts array - check multiple possible field names
+        contracts = response.get("contracts") or response.get("contract") or response.get("data", [])
+        if not isinstance(contracts, list):
+            # If it's not a list, log the full response structure for debugging
+            logger.warning(
+                f"Contracts field is not a list: {type(contracts)}, value={contracts}. "
+                f"Full response keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}"
+            )
+            # If response itself is a list, use it
+            if isinstance(response, list):
+                logger.info("Response is a list, using it directly as contracts")
+                contracts = response
+            else:
+                return []
+        
+        if len(contracts) == 0:
+            logger.warning(
+                f"ProjectX API returned 0 contracts with live={live}. "
+                f"Full response structure: {list(response.keys()) if isinstance(response, dict) else type(response)}"
+            )
+            # Try with empty search as fallback to see if we get any contracts
+            try:
+                logger.info("Attempting to fetch contracts via search endpoint as fallback...")
+                search_result = await self.search_contracts("", live=live)
+                if search_result and len(search_result) > 0:
+                    logger.info(f"Search endpoint returned {len(search_result)} contracts, using those instead")
+                    return search_result
+            except Exception as search_err:
+                logger.debug(f"Search fallback failed: {search_err}")
+        
+        logger.info(f"Successfully fetched {len(contracts)} contracts from ProjectX API")
+        if len(contracts) > 0:
+            logger.debug(f"First contract sample: {contracts[0] if contracts else 'N/A'}")
+        return contracts
 
     async def search_contracts(
         self, search_text: str, live: bool = False
@@ -560,9 +650,29 @@ class TopstepXClient:
         """Return contracts matching the provided search text."""
         payload = {"searchText": search_text, "live": live}
         response = await self._request("POST", "/Contract/search", json=payload)
-        if isinstance(response, dict) and response.get("success"):
-            return response.get("contracts", [])
-        return []
+        
+        # Handle response according to ProjectX API format
+        if not isinstance(response, dict):
+            logger.error(f"Unexpected response type from Contract/search: {type(response)}")
+            return []
+        
+        success = response.get("success", False)
+        error_code = response.get("errorCode", 0)
+        error_message = response.get("errorMessage")
+        
+        if not success or error_code != 0:
+            logger.error(
+                f"Contract/search API returned error: code={error_code}, "
+                f"message={error_message}"
+            )
+            return []
+        
+        contracts = response.get("contracts", [])
+        if not isinstance(contracts, list):
+            logger.warning(f"Contracts field is not a list: {type(contracts)}")
+            return []
+        
+        return contracts
 
     async def get_contract_by_id(
         self, contract_id: str
@@ -589,7 +699,50 @@ class TopstepXClient:
             payload["endTimestamp"] = end_timestamp
 
         response = await self._request("POST", "/Trade/search", json=payload)
-        if isinstance(response, dict) and response.get("success"):
-            return response.get("trades", [])
-        return []
+        
+        # Handle response according to ProjectX API format
+        if not isinstance(response, dict):
+            logger.error(f"Unexpected response type from Trade/search: {type(response)}")
+            return []
+        
+        # Check for success flag and error code
+        success = response.get("success", False)
+        error_code = response.get("errorCode", 0)
+        error_message = response.get("errorMessage")
+        
+        if not success or error_code != 0:
+            logger.error(
+                f"Trade/search API returned error: code={error_code}, "
+                f"message={error_message}"
+            )
+            return []
+        
+        # Extract trades array - each trade has profitAndLoss field for realized P&L
+        trades = response.get("trades", [])
+        if not isinstance(trades, list):
+            logger.warning(f"Trades field is not a list: {type(trades)}")
+            return []
+        
+        logger.debug(f"Successfully fetched {len(trades)} trades from ProjectX API")
+        return trades
+
+    async def get_half_turn_trades(
+        self,
+        account_id: Optional[int] = None,
+        start_timestamp: Optional[str] = None,
+        end_timestamp: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get half-turn trades (trades where profitAndLoss is null, indicating incomplete round-turns).
+        
+        Note: There's no separate endpoint for half-turn trades. They are regular trades
+        where profitAndLoss is null. We filter them from the regular trade search.
+        """
+        # Get all trades and filter for those with null profitAndLoss
+        all_trades = await self.get_trades(
+            account_id=account_id,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+        )
+        # Return only trades where profitAndLoss is null (half-turns)
+        return [t for t in all_trades if t.get("profitAndLoss") is None]
 

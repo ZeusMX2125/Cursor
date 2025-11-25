@@ -1,60 +1,89 @@
-# TopstepX Algorithmic Trading Bot
-
-Production-grade, fully automated trading system for TopstepX that trades Micro E-mini futures (MNQ, MES, MGC) profitably while strictly adhering to Topstep's $50K Combine account rules.
-
-## Project Structure
-
-```
-├── backend/          # Python FastAPI backend
-├── frontend/         # Next.js React frontend
-├── config/           # Configuration files
-└── docker/          # Docker configuration
-```
+# TopstepX Trading Bot
 
 ## Quick Start
 
-### Prerequisites
+### 1. Create Backend Environment File
 
-- Python 3.12+
-- Node.js 18+
-- PostgreSQL 14+ with TimescaleDB extension
-- Docker & Docker Compose (optional)
+**Create `backend/.env` with your credentials:**
 
-### Backend Setup
+```ini
+TOPSTEPX_USERNAME=zeus2026
+TOPSTEPX_API_KEY=0WOCdekBbvzBmetUucgg1NU/4FyIMso4j+XkTYBbn2Q=
+TOPSTEPX_BASE_URL=https://api.topstepx.com/api
+TOPSTEPX_AUTH_MODE=login_key
+TOPSTEPX_VALIDATE_TOKENS=true
+ACCOUNT_SIZE=50000
+PROFIT_TARGET=3000
+DAILY_LOSS_LIMIT=1000
+MAX_DRAWDOWN_LIMIT=2000
+PAPER_TRADING_MODE=true
+LOG_LEVEL=INFO
+```
 
+### 2. Start Services
+
+**Double-click `start.bat`** or run:
+```batch
+start.bat
+```
+
+This opens two windows:
+- **Backend** on http://localhost:8000
+- **Frontend** on http://localhost:3000
+
+### 3. Stop Services
+
+**Double-click `stop.bat`** or run:
+```batch
+stop.bat
+```
+
+## Access
+
+- **Frontend:** http://localhost:3000/trading
+- **Backend API:** http://localhost:8000
+- **API Docs:** http://localhost:8000/docs
+
+## First Time Setup
+
+### Backend Dependencies
 ```bash
 cd backend
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Frontend Setup
-
+### Frontend Dependencies
 ```bash
 cd frontend
 npm install
 ```
 
-### Environment Variables
+## Troubleshooting
 
-Copy `.env.example` to `.env` and fill in your TopstepX API credentials:
+### Backend crashes
+- Check `backend/.env` exists with correct credentials
+- See `backend/ENV_SETUP.md` for details
 
-```bash
-cp config/.env.example config/.env
-```
+### CORS errors
+- Make sure backend is running
+- Restart backend after any changes
+- See `FIX_CORS.md` for details
 
-### Running with Docker
+### Port already in use
+- Run `stop.bat` to kill all services
+- Then run `start.bat` again
 
-```bash
-docker-compose up -d
-```
+## Documentation
 
-## Development
+- `SETUP_COMPLETE.md` - Complete setup guide
+- `CREATE_ENV.md` - .env file contents
+- `backend/ENV_SETUP.md` - Environment variables
+- `FIX_CORS.md` - CORS configuration
+- `BACKEND_REFACTOR.md` - Technical details
 
-See the master plan document for detailed implementation phases and architecture.
+## Scripts
 
-## License
+- **`start.bat`** - Start backend and frontend
+- **`stop.bat`** - Stop all services
 
-Proprietary - Internal Use Only
-
+That's it! Just two scripts to manage everything.

@@ -1,21 +1,64 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import api from '@/lib/api'
+import { useDashboardData } from '@/hooks/useDashboardData'
+import InstrumentSelector from '@/components/InstrumentSelector'
+import { useContracts } from '@/contexts/ContractsContext'
 
 export default function OrderEntry() {
+  const { data } = useDashboardData({ pollInterval: 10000 })
+  const { contracts, getFirstContract, loading: contractsLoading, isValidSymbol } = useContracts()
   const [orderType, setOrderType] = useState<'market' | 'limit'>('market')
   const [quantity, setQuantity] = useState(1)
   const [autoClose, setAutoClose] = useState(true)
+  const [submitting, setSubmitting] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+  const [symbol, setSymbol] = useState<string>('')
 
-  const handleBuy = () => {
-    // TODO: Implement buy order
-    console.log('Buy order:', { orderType, quantity })
+  // Initialize symbol from first available ProjectX contract
+  useEffect(() => {
+    if (!contractsLoading && contracts.length > 0 && !symbol) {
+      const firstContract = getFirstContract()
+      if (firstContract?.symbol) {
+        setSymbol(firstContract.symbol)
+      }
+    }
+  }, [contractsLoading, contracts, symbol, getFirstContract])
+
+  const selectedAccount = data?.projectx?.accounts?.[0]
+  const accountId = selectedAccount?.id
+
+  const handleOrder = async (side: 'BUY' | 'SELL') => {
+    if (!accountId) {
+      setMessage('No account available')
+      return
+    }
+    if (!symbol || !isValidSymbol(symbol)) {
+      setMessage('Invalid symbol. Please select a valid contract.')
+      return
+    }
+    setSubmitting(true)
+    setMessage(null)
+    try {
+      await api.post('/api/trading/place-order', {
+        account_id: Number(accountId),
+        symbol,
+        side,
+        order_type: orderType.toUpperCase(),
+        quantity,
+        time_in_force: 'DAY',
+      })
+      setMessage(`${side} order submitted`)
+    } catch (error: any) {
+      setMessage(error?.response?.data?.detail || error?.message || 'Order failed')
+    } finally {
+      setSubmitting(false)
+    }
   }
 
-  const handleSell = () => {
-    // TODO: Implement sell order
-    console.log('Sell order:', { orderType, quantity })
-  }
+  const handleBuy = () => handleOrder('BUY')
+  const handleSell = () => handleOrder('SELL')
 
   return (
     <div className="bg-dark-card p-4 rounded-lg border border-dark-border">
@@ -70,18 +113,37 @@ export default function OrderEntry() {
         </div>
       </div>
 
+      {message && (
+        <div className={`mb-4 p-2 rounded text-xs ${
+          message.includes('submitted') ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+        }`}>
+          {message}
+        </div>
+      )}
+
+      <div className="mb-4">
+        <label className="block text-xs text-dark-text-muted mb-1">Symbol</label>
+        <InstrumentSelector
+          value={symbol}
+          onChange={setSymbol}
+          disabled={submitting || contractsLoading}
+        />
+      </div>
+
       <div className="grid grid-cols-2 gap-3 mb-4">
         <button
           onClick={handleBuy}
-          className="bg-success hover:bg-success/80 py-3 rounded-lg font-semibold"
+          disabled={submitting || !accountId}
+          className="bg-success hover:bg-success/80 py-3 rounded-lg font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          BUY MKT
+          BUY {orderType.toUpperCase()}
         </button>
         <button
           onClick={handleSell}
-          className="bg-danger hover:bg-danger/80 py-3 rounded-lg font-semibold"
+          disabled={submitting || !accountId}
+          className="bg-danger hover:bg-danger/80 py-3 rounded-lg font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          SELL MKT
+          SELL {orderType.toUpperCase()}
         </button>
       </div>
 

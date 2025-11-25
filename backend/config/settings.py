@@ -18,8 +18,9 @@ class Settings(BaseSettings):
     )
 
     # TopstepX API Credentials (ProjectX Gateway API)
-    topstepx_username: str
-    topstepx_api_key: str
+    # Required for login_key mode (standard auth)
+    topstepx_username: Optional[str] = None
+    topstepx_api_key: Optional[str] = None
     topstepx_base_url: str = "https://api.topstepx.com/api"
     
     @field_validator("topstepx_base_url")
@@ -40,12 +41,49 @@ class Settings(BaseSettings):
             )
         return v
     topstepx_auth_mode: Literal["login_key", "login_app"] = "login_key"
+    
+    # Optional: loginApp mode credentials (rarely needed - most users use login_key)
     topstepx_app_username: Optional[str] = None
     topstepx_app_password: Optional[str] = None
     topstepx_app_id: Optional[str] = None
     topstepx_app_verify_key: Optional[str] = None
     topstepx_app_device_id: Optional[str] = "algox-client"
+    
     topstepx_validate_tokens: bool = True
+    
+    def validate_credentials(self) -> None:
+        """Validate that required credentials are present based on auth mode."""
+        auth_mode = self.topstepx_auth_mode.lower()
+        
+        if auth_mode == "login_app":
+            missing = []
+            if not self.topstepx_app_username:
+                missing.append("TOPSTEPX_APP_USERNAME")
+            if not self.topstepx_app_password:
+                missing.append("TOPSTEPX_APP_PASSWORD")
+            if not self.topstepx_app_id:
+                missing.append("TOPSTEPX_APP_ID")
+            if not self.topstepx_app_verify_key:
+                missing.append("TOPSTEPX_APP_VERIFY_KEY")
+            
+            if missing:
+                raise ValueError(
+                    f"Auth mode 'login_app' requires: {', '.join(missing)}. "
+                    "Check your backend/.env file."
+                )
+        else:  # login_key (default)
+            missing = []
+            if not self.topstepx_username:
+                missing.append("TOPSTEPX_USERNAME")
+            if not self.topstepx_api_key:
+                missing.append("TOPSTEPX_API_KEY")
+            
+            if missing:
+                raise ValueError(
+                    f"Auth mode 'login_key' requires: {', '.join(missing)}. "
+                    "Get your API key from https://app.topstepx.com (Settings → API Access). "
+                    "Then add to backend/.env file."
+                )
 
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/topstepx_bot"

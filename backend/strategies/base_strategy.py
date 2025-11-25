@@ -1,10 +1,10 @@
 """Base strategy class for all trading strategies."""
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import polars as pl
-
+from ml.feature_engineering import FeatureEngineer
 
 class TradingSignal:
     """Represents a trading signal."""
@@ -19,6 +19,7 @@ class TradingSignal:
         order_type: str = "MARKET",
         confidence: float = 1.0,
         strategy_name: str = "",
+        metadata: Optional[Dict] = None
     ):
         self.symbol = symbol
         self.side = side  # "BUY" or "SELL"
@@ -28,6 +29,7 @@ class TradingSignal:
         self.order_type = order_type
         self.confidence = confidence
         self.strategy_name = strategy_name
+        self.metadata = metadata or {}
 
     def to_dict(self) -> Dict:
         """Convert signal to dictionary."""
@@ -40,6 +42,7 @@ class TradingSignal:
             "order_type": self.order_type,
             "confidence": self.confidence,
             "strategy_name": self.strategy_name,
+            "metadata": self.metadata
         }
 
 
@@ -50,6 +53,7 @@ class BaseStrategy(ABC):
         self.name = name
         self.symbols = symbols
         self.enabled = True
+        self.feature_engineer = FeatureEngineer()
 
     @abstractmethod
     async def analyze(
@@ -79,4 +83,9 @@ class BaseStrategy(ABC):
     def disable(self) -> None:
         """Disable the strategy."""
         self.enabled = False
-
+        
+    def enrich_signal(self, signal: TradingSignal, bars: pl.DataFrame) -> TradingSignal:
+        """Enrich signal with market features for ML."""
+        features = self.feature_engineer.extract_features(bars)
+        signal.metadata["market_features"] = features
+        return signal

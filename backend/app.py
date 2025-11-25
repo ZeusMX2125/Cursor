@@ -8,10 +8,11 @@ import os
 import random
 import re
 from datetime import datetime, timedelta
+import pytz
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -26,10 +27,16 @@ from backtesting.deep_backtester import DeepBacktester
 from api.auth_manager import AuthManager
 from api.projectx_service import ProjectXService
 from api.topstepx_client import TopstepXClient
+from api.topstepx_client_v2 import TopstepXClientV2
+from api.projectx_service_v2 import ProjectXServiceV2
 from api.websocket_handler import WebSocketHandler
 from api.websocket_manager import websocket_manager
+from api.ml_endpoints import router as ml_router
 
 app = FastAPI(title="TopstepX Trading Bot API", version="1.0.0")
+
+# Include ML router
+app.include_router(ml_router)
 
 # Configure file logging so backend logs are saved for troubleshooting
 LOG_DIR = Path("logs")
@@ -45,7 +52,18 @@ logger.add(
 )
 
 # CORS configuration - use only CORSMiddleware (no custom middleware)
-ALLOWED_ORIGINS = ["http://localhost:3000"]  # explicit when credentials may be used
+# Allow additional origins via env (comma-separated) to avoid common dev CORS issues
+_default_origins = {
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+}
+_env_origins = {
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+    if origin.strip()
+}
+ALLOWED_ORIGINS = sorted(_default_origins | _env_origins)
+logger.info(f"CORS allowed origins: {ALLOWED_ORIGINS}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,6 +74,35 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=86400,
 )
+
+
+def _resolve_request_origin(request: Request) -> Optional[str]:
+    """Return the allowed origin for this request, if any."""
+    origin = request.headers.get("origin")
+    if origin and origin in ALLOWED_ORIGINS:
+        return origin
+    return None
+
+
+def _attach_cors_headers(response: Response, origin: Optional[str]) -> Response:
+    """Attach Access-Control-Allow-Origin when the request origin is allowed."""
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        vary_header = response.headers.get("Vary")
+        if vary_header:
+            if "Origin" not in vary_header:
+                response.headers["Vary"] = f"{vary_header}, Origin"
+        else:
+            response.headers["Vary"] = "Origin"
+    return response
+
+
+@app.middleware("http")
+async def ensure_cors_headers(request: Request, call_next):
+    """Ensure every response (success or error) carries CORS headers when allowed."""
+    origin = _resolve_request_origin(request)
+    response = await call_next(request)
+    return _attach_cors_headers(response, origin)
 
 def _resolve_existing_path(candidates: List[str]) -> Optional[Path]:
     """Return the first existing path from the provided candidate list."""
@@ -90,7 +137,7 @@ def _require_config_files(settings: Settings) -> None:
     else:
         required_fields = {
             "TOPSTEPX_USERNAME": settings.topstepx_username,
-            "TOPSTEPX_API_": settings.topstepx_api_key,
+            "TOPSTEPX_API_KEY": settings.topstepx_api_key,
         }
 
     missing_creds = [name for name, value in required_fields.items() if not value]
@@ -116,21 +163,25 @@ def _require_config_files(settings: Settings) -> None:
 
 try:
     settings = Settings()
+    # Validate credentials based on auth mode
+    settings.validate_credentials()
 except Exception as e:
     import sys
     print("\n" + "="*80)
-    print("ERROR: Failed to load settings from .env file")
+    print("ERROR: Failed to load or validate settings")
     print("="*80)
     print(f"\nError details: {e}")
     print("\nPlease check your .env file in the backend/ directory.")
     print("It should contain lines like:")
     print("  TOPSTEPX_USERNAME=your_username")
     print("  TOPSTEPX_API_KEY=your_api_key")
+    print("  TOPSTEPX_BASE_URL=https://api.topstepx.com/api")
     print("\nMake sure:")
     print("  1. Each variable is on its own line")
     print("  2. No spaces around the = sign")
     print("  3. No special characters or BOM at the start of the file")
     print("  4. The file is saved as UTF-8 encoding")
+    print("\nSee backend/ENV_SETUP.md for detailed instructions.")
     print("="*80 + "\n")
     sys.exit(1)
 account_manager: Optional[AccountManager] = None
@@ -138,43 +189,54 @@ deep_backtester: Optional[DeepBacktester] = None
 shared_auth_manager: Optional[AuthManager] = None
 shared_market_client: Optional[TopstepXClient] = None
 projectx_service: Optional[ProjectXService] = None
+# V2 client with Result-based error handling (migration in progress)
+shared_market_client_v2: Optional[TopstepXClientV2] = None
+projectx_service_v2: Optional[ProjectXServiceV2] = None
 projectx_ws_handler: Optional[WebSocketHandler] = None
 # Unified error handlers so even failures get JSON (CORS will be applied)
 # Return JSON for *all* errors; CORSMiddleware will attach headers.
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle request validation errors with CORS headers."""
-    return JSONResponse(
+    origin = _resolve_request_origin(request)
+    response = JSONResponse(
         status_code=422,
-        content={"detail": exc.errors(), "body": exc.body}
+        content={"detail": exc.errors(), "body": exc.body},
     )
+    return _attach_cors_headers(response, origin)
+
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exc_handler(request: Request, exc: StarletteHTTPException):
     """Handle HTTP exceptions with CORS headers."""
-    return JSONResponse(
+    origin = _resolve_request_origin(request)
+    response = JSONResponse(
         status_code=exc.status_code,
-        content={"detail": str(exc.detail)}
+        content={"detail": str(exc.detail)},
     )
+    return _attach_cors_headers(response, origin)
+
 
 @app.exception_handler(Exception)
 async def internal_exc_handler(request: Request, exc: Exception):
     """Handle all other exceptions with CORS headers."""
     logger.error(f"Unhandled error for request {request.url}: {exc}", exc_info=True)
-    return JSONResponse(
+    origin = _resolve_request_origin(request)
+    response = JSONResponse(
         status_code=500,
-        content={"detail": "Internal Server Error"}
+        content={"detail": "Internal Server Error"},
     )
+    return _attach_cors_headers(response, origin)
 
 
-SUPPORTED_TIMEFRAMES = {"1m", "5m", "15m", "30m", "60m"}
+SUPPORTED_TIMEFRAMES = {"1m", "5m", "15m", "30m", "60m", "1h", "4h", "1d"}
 MAX_CHART_BARS = 2000
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup."""
-    global account_manager, deep_backtester, shared_auth_manager, shared_market_client, projectx_service, projectx_ws_handler
+    global account_manager, deep_backtester, shared_auth_manager, shared_market_client, projectx_service, projectx_ws_handler, shared_market_client_v2, projectx_service_v2
 
     _require_config_files(settings)
 
@@ -243,6 +305,13 @@ async def startup_event():
     
     # Create service immediately (it will wait for auth when needed)
     projectx_service = ProjectXService(shared_market_client)
+    
+    # Initialize V2 client + service with Result-based error handling
+    shared_market_client_v2 = TopstepXClientV2(settings, shared_auth_manager)
+    await shared_market_client_v2.initialize()
+    projectx_service_v2 = ProjectXServiceV2(shared_market_client_v2)
+    logger.info("V2 client initialized (Result-based error handling)")
+    
     projectx_ws_handler = WebSocketHandler(
         settings, shared_auth_manager, shared_market_client
     )
@@ -250,8 +319,72 @@ async def startup_event():
     def _make_ws_forwarder(event_type: str):
         async def forward(payload: Dict):
             await websocket_manager.broadcast({"type": event_type, "payload": payload})
+            # When trades update, trigger a refresh of realized P&L
+            if event_type == "trade_update" and projectx_service:
+                try:
+                    # Trigger a quick refresh of positions with updated realized P&L
+                    # This ensures P&L updates immediately when trades complete
+                    asyncio.create_task(_refresh_positions_pnl())
+                except Exception as e:
+                    logger.debug(f"Error refreshing P&L on trade update: {e}")
+            # When quotes update, trigger a position refresh to update unrealized P&L
+            if event_type == "quote_update" and projectx_service:
+                try:
+                    # Trigger a quick refresh of positions with updated quotes for unrealized P&L
+                    asyncio.create_task(_refresh_positions_with_quotes())
+                except Exception as e:
+                    logger.debug(f"Error refreshing positions with quotes: {e}")
 
         return forward
+    
+    async def _refresh_positions_with_quotes():
+        """Refresh positions with updated quotes to recalculate unrealized P&L."""
+        try:
+            if not projectx_service:
+                return
+            # Get all accounts and their positions
+            accounts = await projectx_service.get_accounts()
+            for account in accounts:
+                account_id = account.get("id")
+                if account_id:
+                    try:
+                        # Get positions with latest quotes applied
+                        positions = await projectx_service.get_positions(account_id=account_id)
+                        # Broadcast updated positions with current prices from quotes
+                        await websocket_manager.broadcast({
+                            "type": "positions_refresh",
+                            "account_id": account_id,
+                            "positions": positions,
+                            "timestamp": datetime.utcnow().isoformat(),
+                        })
+                    except Exception as e:
+                        logger.debug(f"Error refreshing positions for account {account_id}: {e}")
+        except Exception as e:
+            logger.debug(f"Error in _refresh_positions_with_quotes: {e}")
+    
+    async def _refresh_positions_pnl():
+        """Refresh positions with updated realized P&L after trade updates."""
+        try:
+            if not projectx_service:
+                return
+            # Get updated realized P&L from trades
+            accounts = await projectx_service.get_accounts()
+            for account in accounts:
+                account_id = account.get("id")
+                if account_id:
+                    try:
+                        realized_pnl_by_symbol = await projectx_service.get_realized_pnl_for_positions(account_id=account_id)
+                        # Broadcast updated realized P&L
+                        await websocket_manager.broadcast({
+                            "type": "realized_pnl_update",
+                            "account_id": account_id,
+                            "realized_pnl_by_symbol": realized_pnl_by_symbol,
+                            "timestamp": datetime.utcnow().isoformat(),
+                        })
+                    except Exception as e:
+                        logger.debug(f"Error refreshing P&L for account {account_id}: {e}")
+        except Exception as e:
+            logger.debug(f"Error in _refresh_positions_pnl: {e}")
 
     for event_name in (
         "account_update",
@@ -297,12 +430,14 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
-    global account_manager, shared_market_client, projectx_ws_handler
+    global account_manager, shared_market_client, shared_market_client_v2, projectx_ws_handler
 
     if account_manager:
         await account_manager.stop_all()
     if shared_market_client:
         await shared_market_client.close()
+    if shared_market_client_v2:
+        await shared_market_client_v2.close()
     if projectx_ws_handler:
         await projectx_ws_handler.disconnect()
 
@@ -322,25 +457,86 @@ async def root():
         }
     }
 
-@app.get("/api/test/cors")
-async def test_cors():
-    """Test endpoint to verify CORS is working."""
-    return {
-        "message": "CORS test successful",
-        "timestamp": datetime.utcnow().isoformat(),
-        "cors_configured": True
-    }
+# DEBUG/TEST ENDPOINTS - Commented out for production
+# Uncomment these only for debugging CORS or contract issues
 
-# Canary routes to prove CORS is working (bypass ProjectX client)
-@app.get("/api/cors-ok")
-async def cors_ok():
-    """Simple GET endpoint to test CORS headers."""
-    return {"ok": True}
+# @app.get("/api/test/cors")
+# async def test_cors():
+#     """Test endpoint to verify CORS is working."""
+#     return {
+#         "message": "CORS test successful",
+#         "timestamp": datetime.utcnow().isoformat(),
+#         "cors_configured": True
+#     }
 
-@app.post("/api/cors-ok")
-async def cors_ok_post(payload: dict):
-    """Simple POST endpoint to test CORS headers."""
-    return {"received": payload}
+# @app.get("/api/cors-ok")
+# async def cors_ok():
+#     """Simple GET endpoint to test CORS headers."""
+#     return {"ok": True}
+
+# @app.post("/api/cors-ok")
+# async def cors_ok_post(payload: dict):
+#     """Simple POST endpoint to test CORS headers."""
+#     return {"received": payload}
+
+# @app.get("/api/debug/contracts-test")
+# async def debug_contracts_test():
+#     """Debug endpoint to test contracts endpoint without frontend."""
+#     try:
+#         if not projectx_service_v2:
+#             return {
+#                 "error": "V2 service not initialized",
+#                 "projectx_service_v2": projectx_service_v2 is not None,
+#                 "projectx_service": projectx_service is not None
+#             }
+#         
+#         result = await projectx_service_v2.get_contracts(live=True)
+#         
+#         if result.is_error():
+#             from api.result import Error
+#             if isinstance(result, Error):
+#                 return {
+#                     "error": True,
+#                     "message": result.message,
+#                     "status_code": result.status_code,
+#                     "error_code": result.error_code,
+#                     "details": result.details
+#                 }
+#             return {"error": True, "message": str(result)}
+#         
+#         contracts = result.unwrap()
+#         return {
+#             "success": True,
+#             "contracts_count": len(contracts) if isinstance(contracts, list) else 0,
+#             "sample": contracts[:3] if isinstance(contracts, list) and len(contracts) > 0 else None
+#         }
+#     except Exception as e:
+#         logger.error(f"Debug endpoint error: {e}", exc_info=True)
+#         return {"error": True, "exception": str(e), "type": type(e).__name__}
+
+
+def _is_trading_hours() -> bool:
+    """Check if current time is within TopstepX trading hours (futures market hours).
+    
+    Trading hours: 5:00 PM CT (previous day) to 3:10 PM CT (current day)
+    This covers the overnight session and regular trading hours.
+    """
+    try:
+        ct = pytz.timezone("America/Chicago")
+        now = datetime.now(ct)
+        hour = now.hour
+        minute = now.minute
+
+        # Trading hours: 5:00 PM CT (17:00) to 3:10 PM CT (15:10) next day
+        if hour >= 17 or hour < 15:
+            return True
+        if hour == 15 and minute <= 10:
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"Error checking trading hours: {e}")
+        # Default to allowing orders if we can't determine hours
+        return True
 
 
 @app.get("/health")
@@ -379,11 +575,12 @@ async def health():
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time data streaming to frontend."""
     origin = websocket.headers.get("origin")
-    # Allow connections from frontend origins
+    # Allow connections from frontend origins or if origin is missing (direct connections)
     if origin and origin not in ALLOWED_ORIGINS:
         logger.warning(f"WebSocket connection rejected from origin: {origin}")
         await websocket.close(code=1008, reason="Origin not allowed")
         return
+    # If no origin header, allow connection (for direct WebSocket connections)
     
     try:
         await websocket_manager.connect(websocket)
@@ -396,20 +593,51 @@ async def websocket_endpoint(websocket: WebSocket):
             pass
         return
     
+    # Send initial connection confirmation
     try:
+        await websocket_manager.send_personal_message(
+            {"type": "connected", "timestamp": datetime.utcnow().isoformat()},
+            websocket
+        )
+    except Exception as e:
+        logger.debug(f"Could not send initial connection message: {e}")
+    
+    try:
+        # Use asyncio.wait_for to handle timeouts gracefully
         while True:
-            # Keep connection alive and handle any incoming messages
-            data = await websocket.receive_text()
             try:
-                message = json.loads(data)
-                # Handle client messages if needed (e.g., subscriptions)
-                if message.get("type") == "ping":
-                    await websocket_manager.send_personal_message(
-                        {"type": "pong", "timestamp": datetime.utcnow().isoformat()},
-                        websocket
-                    )
-            except json.JSONDecodeError:
-                logger.warning(f"Invalid JSON from WebSocket client: {data}")
+                # Wait for message with timeout to allow periodic health checks
+                # This prevents the connection from hanging indefinitely
+                data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=60.0  # 60 second timeout
+                )
+                try:
+                    message = json.loads(data)
+                    # Handle client messages if needed (e.g., subscriptions)
+                    if message.get("type") == "ping":
+                        await websocket_manager.send_personal_message(
+                            {"type": "pong", "timestamp": datetime.utcnow().isoformat()},
+                            websocket
+                        )
+                        logger.debug("Received ping, sent pong")
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON from WebSocket client: {data}")
+            except asyncio.TimeoutError:
+                # Timeout is normal - just continue the loop to keep connection alive
+                # The frontend will send pings periodically
+                # Check if connection is still alive
+                try:
+                    # Send a keepalive ping to check connection health
+                    await websocket.send_text(json.dumps({
+                        "type": "keepalive",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }))
+                except Exception:
+                    # Connection is dead, break out of loop
+                    logger.debug("WebSocket connection appears dead, closing")
+                    break
+                continue
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected normally")
         await websocket_manager.disconnect(websocket)
@@ -421,48 +649,46 @@ async def websocket_endpoint(websocket: WebSocket):
             pass
 
 
-@app.get("/api/account/balance")
-async def get_account_balance(account_id: Optional[int] = None):
-    """Get account balance."""
-    if not projectx_service:
-        logger.warning("ProjectX service not initialized when balance requested")
-        raise HTTPException(status_code=503, detail="ProjectX service not initialized. Please wait for startup to complete.")
+# DEPRECATED ENDPOINTS - Replaced by more specific endpoints
+# These are kept commented for reference but should not be used
 
-    try:
-        balance = await projectx_service.get_account_balance(account_id=account_id)
-        return {"balance": balance}
-    except Exception as e:
-        logger.error(f"Error fetching account balance: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to fetch balance: {str(e)}")
+# @app.get("/api/account/balance")
+# async def get_account_balance(account_id: Optional[int] = None):
+#     """DEPRECATED: Use /api/dashboard/state or /api/accounts/{account_id} instead."""
+#     if not projectx_service:
+#         logger.warning("ProjectX service not initialized when balance requested")
+#         raise HTTPException(status_code=503, detail="ProjectX service not initialized. Please wait for startup to complete.")
+#     try:
+#         balance = await projectx_service.get_account_balance(account_id=account_id)
+#         return {"balance": balance}
+#     except Exception as e:
+#         logger.error(f"Error fetching account balance: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=f"Failed to fetch balance: {str(e)}")
 
+# @app.get("/api/positions")
+# async def get_positions(account_id: Optional[int] = None):
+#     """DEPRECATED: Use /api/trading/positions/{account_id} instead."""
+#     if not projectx_service:
+#         logger.warning("ProjectX service not initialized when positions requested")
+#         raise HTTPException(status_code=503, detail="ProjectX service not initialized. Please wait for startup to complete.")
+#     try:
+#         positions = await projectx_service.get_positions(account_id=account_id)
+#         return {"positions": positions}
+#     except Exception as e:
+#         logger.error(f"Error fetching positions: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
 
-@app.get("/api/positions")
-async def get_positions(account_id: Optional[int] = None):
-    """Get open positions."""
-    if not projectx_service:
-        logger.warning("ProjectX service not initialized when positions requested")
-        raise HTTPException(status_code=503, detail="ProjectX service not initialized. Please wait for startup to complete.")
-
-    try:
-        positions = await projectx_service.get_positions(account_id=account_id)
-        return {"positions": positions}
-    except Exception as e:
-        logger.error(f"Error fetching positions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
-
-
-@app.get("/api/stats")
-async def get_stats():
-    """Get trading statistics."""
-    if not projectx_service:
-        raise HTTPException(status_code=503, detail="ProjectX service not initialized")
-
-    try:
-        summary = await projectx_service.get_trades_summary()
-        return summary["metrics"]
-    except Exception as e:
-        logger.error(f"Error fetching stats: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to fetch stats: {str(e)}")
+# @app.get("/api/stats")
+# async def get_stats():
+#     """DEPRECATED: Use /api/dashboard/state instead."""
+#     if not projectx_service:
+#         raise HTTPException(status_code=503, detail="ProjectX service not initialized")
+#     try:
+#         summary = await projectx_service.get_trades_summary()
+#         return summary["metrics"]
+#     except Exception as e:
+#         logger.error(f"Error fetching stats: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=f"Failed to fetch stats: {str(e)}")
 
 
 @app.post("/api/config/save")
@@ -501,34 +727,34 @@ async def save_config(config: dict):
         raise HTTPException(status_code=500, detail=f"Failed to save config: {str(e)}")
 
 
-@app.post("/api/engine/start")
-async def start_engine():
-    """Start trading engine."""
-    if not account_manager:
-        raise HTTPException(status_code=503, detail="Account manager not initialized")
-    
-    try:
-        await account_manager.start_all()
-        logger.info("Trading engine started for all enabled accounts")
-        return {"status": "started", "message": "All enabled accounts started"}
-    except Exception as e:
-        logger.error(f"Error starting engine: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to start engine: {str(e)}")
+# DEPRECATED ENDPOINTS - Use account-specific endpoints instead
+# These old single-engine endpoints are replaced by /api/accounts/{id}/start and /api/accounts/{id}/stop
 
+# @app.post("/api/engine/start")
+# async def start_engine():
+#     """DEPRECATED: Use /api/accounts/start-all or /api/accounts/{id}/start instead."""
+#     if not account_manager:
+#         raise HTTPException(status_code=503, detail="Account manager not initialized")
+#     try:
+#         await account_manager.start_all()
+#         logger.info("Trading engine started for all enabled accounts")
+#         return {"status": "started", "message": "All enabled accounts started"}
+#     except Exception as e:
+#         logger.error(f"Error starting engine: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=f"Failed to start engine: {str(e)}")
 
-@app.post("/api/engine/stop")
-async def stop_engine():
-    """Stop trading engine."""
-    if not account_manager:
-        raise HTTPException(status_code=503, detail="Account manager not initialized")
-    
-    try:
-        await account_manager.stop_all()
-        logger.info("Trading engine stopped for all accounts")
-        return {"status": "stopped", "message": "All accounts stopped"}
-    except Exception as e:
-        logger.error(f"Error stopping engine: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to stop engine: {str(e)}")
+# @app.post("/api/engine/stop")
+# async def stop_engine():
+#     """DEPRECATED: Use /api/accounts/stop-all or /api/accounts/{id}/stop instead."""
+#     if not account_manager:
+#         raise HTTPException(status_code=503, detail="Account manager not initialized")
+#     try:
+#         await account_manager.stop_all()
+#         logger.info("Trading engine stopped for all accounts")
+#         return {"status": "stopped", "message": "All accounts stopped"}
+#     except Exception as e:
+#         logger.error(f"Error stopping engine: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=f"Failed to stop engine: {str(e)}")
 
 
 # Multi-Account Endpoints
@@ -591,6 +817,57 @@ async def stop_account(account_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/accounts/{account_id}/status")
+async def get_account_status(account_id: str):
+    """Get bot running status for an account."""
+    # First check if account is in account_manager (bot-managed)
+    if account_manager:
+        try:
+            account_status = account_manager.get_account_status(account_id)
+            if account_status:
+                is_running = account_id in account_manager.bots
+                active_strategy = account_manager.active_strategies.get(account_id)
+                bot_health = account_manager.get_bot_health(account_id)
+                
+                return {
+                    "account_id": account_id,
+                    "running": is_running,
+                    "active_strategy": active_strategy,
+                    "status": "running" if is_running else "stopped",
+                    "name": account_status.get("name"),
+                    "enabled": account_status.get("enabled", False),
+                    "bot_managed": True,
+                    "bot_health": bot_health,
+                }
+        except Exception as e:
+            logger.error(f"Error getting account status from account_manager: {e}", exc_info=True)
+    
+    # If not in account_manager, check if it's a ProjectX account
+    if projectx_service:
+        try:
+            accounts = await asyncio.wait_for(
+                projectx_service.get_accounts(),
+                timeout=8.0
+            )
+            for account in accounts:
+                if str(account.get("id")) == str(account_id):
+                    # This is a ProjectX account but not bot-managed
+                    return {
+                        "account_id": account_id,
+                        "running": False,
+                        "active_strategy": None,
+                        "status": "not_managed",
+                        "name": account.get("name") or f"Account {account_id}",
+                        "enabled": False,
+                        "bot_managed": False,
+                    }
+        except Exception as e:
+            logger.error(f"Error checking ProjectX accounts: {e}", exc_info=True)
+    
+    # Account not found in either system
+    raise HTTPException(status_code=404, detail=f"Account {account_id} not found")
+
+
 @app.post("/api/accounts/start-all")
 async def start_all_accounts():
     """Start all enabled accounts."""
@@ -617,18 +894,105 @@ async def stop_all_accounts():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/accounts/{account_id}/activity")
+async def get_bot_activity(account_id: str, limit: int = 50):
+    """Get bot activity log for an account."""
+    if not account_manager:
+        raise HTTPException(status_code=503, detail="Account manager not initialized")
+    
+    try:
+        activities = await account_manager.get_bot_activity(account_id, limit)
+        return {"account_id": account_id, "activities": activities}
+    except Exception as e:
+        logger.error(f"Error getting bot activity: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/accounts/add")
+async def add_account(account_data: dict):
+    """Add an account to the bot manager configuration."""
+    from accounts.account_loader import add_account_to_config
+    
+    try:
+        # Validate required fields
+        if not account_data.get("account_id"):
+            raise HTTPException(status_code=400, detail="account_id is required")
+        if not account_data.get("name"):
+            raise HTTPException(status_code=400, detail="name is required")
+        if not account_data.get("stage"):
+            raise HTTPException(status_code=400, detail="stage is required")
+        if not account_data.get("size"):
+            raise HTTPException(status_code=400, detail="size is required")
+        
+        # Add account to config file
+        await add_account_to_config(account_data)
+        
+        # Reload accounts in account manager if it exists
+        if account_manager:
+            try:
+                account_manager.accounts = await load_accounts()
+                logger.info(f"Reloaded accounts after adding {account_data['account_id']}")
+            except Exception as e:
+                logger.warning(f"Could not reload accounts in manager: {e}")
+        
+        return {
+            "status": "added",
+            "account_id": account_data["account_id"],
+            "message": f"Account {account_data['account_id']} added successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding account: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to add account: {str(e)}")
+
+
 # Dashboard data for UI
 async def _build_dashboard_state() -> Dict:
     """Aggregate dashboard stats for UI."""
     if not projectx_service:
         raise HTTPException(status_code=503, detail="ProjectX service not initialized")
 
-    projectx_accounts, positions, orders_summary, trades_summary = await asyncio.gather(
-        projectx_service.get_accounts(),
-        projectx_service.get_positions(),
-        projectx_service.get_orders(),
-        projectx_service.get_trades_summary(),
-    )
+    try:
+        # Add timeout to prevent hanging - 8 seconds total (frontend timeout is 10s)
+        projectx_accounts, positions, orders_summary, trades_summary = await asyncio.wait_for(
+            asyncio.gather(
+                projectx_service.get_accounts(),
+                projectx_service.get_positions(),
+                projectx_service.get_orders(),
+                projectx_service.get_trades_summary(),
+                return_exceptions=True  # Don't fail if one call fails
+            ),
+            timeout=8.0  # 8 second timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error("Timeout building dashboard state - API calls took too long")
+        # Return empty data instead of failing
+        projectx_accounts = []
+        positions = []
+        orders_summary = {"open": [], "recent": []}
+        trades_summary = {"metrics": {}, "trades": []}
+    except Exception as e:
+        logger.error(f"Error fetching dashboard data: {e}", exc_info=True)
+        # Return empty data instead of failing
+        projectx_accounts = []
+        positions = []
+        orders_summary = {"open": [], "recent": []}
+        trades_summary = {"metrics": {}, "trades": []}
+    
+    # Handle exceptions from gather
+    if isinstance(projectx_accounts, Exception):
+        logger.error(f"Error fetching accounts: {projectx_accounts}")
+        projectx_accounts = []
+    if isinstance(positions, Exception):
+        logger.error(f"Error fetching positions: {positions}")
+        positions = []
+    if isinstance(orders_summary, Exception):
+        logger.error(f"Error fetching orders: {orders_summary}")
+        orders_summary = {"open": [], "recent": []}
+    if isinstance(trades_summary, Exception):
+        logger.error(f"Error fetching trades: {trades_summary}")
+        trades_summary = {"metrics": {}, "trades": []}
 
     formatted_accounts = [
         {
@@ -654,7 +1018,8 @@ async def _build_dashboard_state() -> Dict:
         try:
             bot_snapshots = await account_manager.get_all_snapshots()
         except Exception as exc:
-            logger.debug(f"Unable to load bot snapshots: {exc}")
+            logger.warning(f"Unable to load bot snapshots: {exc}", exc_info=True)
+            bot_snapshots = []
 
     return {
         "accounts": bot_snapshots,
@@ -804,6 +1169,12 @@ async def get_candles(
         raise HTTPException(status_code=503, detail="ProjectX service not initialized")
 
     symbol = symbol.strip().upper()
+    if not symbol:
+        raise HTTPException(
+            status_code=400,
+            detail="Symbol parameter is required and cannot be empty"
+        )
+    
     timeframe = timeframe.strip().lower()
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise HTTPException(
@@ -817,35 +1188,84 @@ async def get_candles(
     minutes = _timeframe_to_minutes(timeframe) * bars
     start_dt = end_dt - timedelta(minutes=minutes or bars)
 
+    def _symbol_variants(value: str) -> List[str]:
+        upper = value.upper()
+        variants = [upper, upper.rstrip("0123456789"), "".join(ch for ch in upper if ch.isalpha())]
+        return [v for v in variants if v]
+
+    contract_match: Optional[Dict[str, Any]] = None
     try:
-        # Extract base symbol (e.g., "ES" from "ESZ25" or "ESZ5")
-        base_symbol = symbol
-        # Remove month/year suffixes if present (e.g., Z25, Z5, U25, etc.)
-        if len(symbol) > 2 and symbol[-1].isdigit():
-            # Try to extract just the base (ES, NQ, etc.)
-            for i in range(len(symbol) - 1, 0, -1):
-                if symbol[i].isalpha():
-                    base_symbol = symbol[:i+1]
+        contracts = await projectx_service.get_contracts()
+        target = symbol.upper()
+        stripped = target.rstrip("0123456789")
+        for contract in contracts:
+            candidates = _symbol_variants(contract.get("symbol") or "")
+            candidates += _symbol_variants(contract.get("name") or "")
+            candidates += _symbol_variants(contract.get("baseSymbol") or "")
+            candidates += _symbol_variants(contract.get("id") or "")
+            for candidate in candidates:
+                if candidate and (candidate == target or candidate == stripped or target.startswith(candidate)):
+                    contract_match = contract
                     break
-        
-        candles = await projectx_service.get_candles(
-            symbol=base_symbol,
-            timeframe=timeframe,
-            start=start_dt,
-            end=end_dt,
-        )
+            if contract_match:
+                break
     except Exception as exc:
-        logger.error(f"Error fetching candles for {symbol} (base: {base_symbol}): {exc}", exc_info=True)
-        error_msg = str(exc)
-        if "Unable to find instrument" in error_msg:
+        logger.debug(f"Unable to pre-select contract for {symbol}: {exc}")
+
+    symbol_attempts: List[str] = []
+    if contract_match:
+        preferred = contract_match.get("symbol") or contract_match.get("name")
+        if preferred:
+            symbol_attempts.append(str(preferred).upper())
+        base = contract_match.get("baseSymbol")
+        if base:
+            symbol_attempts.append(str(base).upper())
+    symbol_attempts.append(symbol.upper())
+
+    if symbol.endswith(("FUT", "F")):
+        symbol_attempts.append(symbol[:-3].upper())
+
+    unique_attempts: List[str] = []
+    seen_attempts = set()
+    for attempt in symbol_attempts:
+        trimmed = attempt.strip().upper()
+        if trimmed and trimmed not in seen_attempts:
+            unique_attempts.append(trimmed)
+            seen_attempts.add(trimmed)
+        stripped_attempt = trimmed.rstrip("0123456789")
+        if stripped_attempt and stripped_attempt not in seen_attempts:
+            unique_attempts.append(stripped_attempt)
+            seen_attempts.add(stripped_attempt)
+
+    candles: Optional[List[Dict[str, Any]]] = None
+    last_error: Optional[Exception] = None
+    resolved_symbol = symbol.upper()
+    for candidate in unique_attempts:
+        try:
+            candles = await projectx_service.get_candles(
+                symbol=candidate,
+                timeframe=timeframe,
+                start=start_dt,
+                end=end_dt,
+            )
+            resolved_symbol = candidate
+            break
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if candles is None:
+        error_msg = str(last_error) if last_error else "Unknown error"
+        logger.error(f"Error fetching candles for {symbol}: {error_msg}", exc_info=bool(last_error))
+        if last_error and "Unable to find instrument" in error_msg:
             raise HTTPException(
                 status_code=404,
                 detail=f"Symbol {symbol} not found. Try: ES, NQ, MNQ, MES, RTY, etc."
-            )
+            ) from last_error
         raise HTTPException(
             status_code=502,
             detail=f"Failed to retrieve candles: {error_msg}"
-        ) from exc
+        ) from last_error or Exception(error_msg)
 
     if not candles:
         raise HTTPException(
@@ -854,7 +1274,7 @@ async def get_candles(
         )
 
     return {
-        "symbol": symbol,
+        "symbol": resolved_symbol,
         "timeframe": timeframe,
         "candles": candles,
         "source": "projectx",
@@ -863,83 +1283,160 @@ async def get_candles(
 
 # Trading Data Endpoints
 
+@app.get("/api/market/search")
+async def search_symbols(query: str = Query(..., min_length=1)):
+    """Search for symbols (ProjectX contracts) - TradingView compatible."""
+    if not projectx_service:
+        raise HTTPException(status_code=503, detail="ProjectX service not initialized")
+    
+    try:
+        service = projectx_service_v2 or projectx_service
+        if not service:
+            raise HTTPException(status_code=503, detail="ProjectX service not initialized")
+            
+        if projectx_service_v2:
+            result = await projectx_service_v2.search_contracts(search_text=query, live=True)
+            if result.is_error():
+                logger.error(f"Error searching symbols: {result.message}")
+                return []
+            contracts = result.unwrap()
+        else:
+            contracts = await projectx_service.search_contracts(search_text=query, live=True)
+        
+        # Format for TradingView or generic frontend use
+        results = []
+        for c in contracts:
+            results.append({
+                "symbol": c.get("symbol"),
+                "full_name": c.get("symbol"),
+                "description": c.get("name") or c.get("description") or c.get("symbol"),
+                "exchange": "TopstepX",
+                "ticker": c.get("symbol"),
+                "type": "futures",
+                "contract_id": c.get("id")
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Error searching symbols: {e}")
+        return []
+
 @app.get("/api/market/contracts")
 async def list_market_contracts(
     live: bool = Query(default=True),
     search: Optional[str] = None
 ):
-    """Return tradable contracts for instrument selection."""
+    """Return tradable contracts for instrument selection (V2 - Result-based)."""
+    logger.info(f"Fetching contracts: live={live}, search={search}")
     try:
-        if not projectx_service:
+        # Use V2 service if available, fallback to V1
+        service = projectx_service_v2 or projectx_service
+        
+        if not service:
             logger.warning("ProjectX service not initialized when contracts requested")
             raise HTTPException(
                 status_code=503,
                 detail="ProjectX service not initialized. Please wait for startup to complete."
             )
 
-        try:
-            if search:
-                contracts = await projectx_service.search_contracts(search_text=search, live=live)
-            else:
-                contracts = await projectx_service.get_contracts(live=live)
-        except Exception as api_exc:
-            logger.error(f"ProjectX API error when fetching contracts: {api_exc}", exc_info=True)
-            # Surface upstream error with sanitized message
-            error_msg = str(api_exc)
-            # Limit error message length to prevent huge responses
-            if len(error_msg) > 200:
-                error_msg = error_msg[:200] + "..."
-            raise HTTPException(
-                status_code=502,
-                detail=f"Failed to fetch contracts from ProjectX API: {error_msg}"
-            ) from api_exc
-        
-        if not contracts:
-            contracts = []  # Ensure it's always a list
-        
-        def _map_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
+        # Call service (V2 returns Result, V1 raises exceptions)
+        if projectx_service_v2:
             try:
-                if not isinstance(contract, dict):
-                    return {}
-                symbol = contract.get("symbol") or contract.get("name") or contract.get("contractName") or ""
-                description = contract.get("description") or contract.get("displayName") or contract.get("name") or ""
-                base_symbol = ""
-                if symbol:
-                    for char in symbol:
-                        if char.isalpha():
-                            base_symbol += char
-                        else:
-                            break
-                return {
-                    "id": contract.get("id") or contract.get("contractId") or "",
-                    "symbol": symbol,
-                    "name": contract.get("name") or "",
-                    "description": description,
-                    "baseSymbol": base_symbol or symbol,
-                    "tickSize": contract.get("tickSize"),
-                    "tickValue": contract.get("tickValue"),
-                    "exchange": contract.get("exchange") or "",
-                    "live": contract.get("live", live),
-                }
-            except Exception as map_err:
-                logger.warning(f"Error mapping contract: {map_err}")
-                return {}
-
-        mapped = [_map_contract(c) for c in contracts if c]
-        return {"contracts": mapped}
-        
+                if search:
+                    result = await projectx_service_v2.search_contracts(search_text=search, live=live)
+                else:
+                    # get_contracts now handles fallback internally
+                    result = await projectx_service_v2.get_contracts(live=live)
+                
+                # Handle Result type - check if it's an Error
+                if result.is_error():
+                    # Type narrowing: if is_error() is True, result must be Error
+                    from api.result import Error
+                    if isinstance(result, Error):
+                        error_msg = result.message
+                        error_status = result.status_code
+                    else:
+                        # Fallback if type checking fails
+                        error_msg = getattr(result, 'message', f"Unknown error: {type(result)}")
+                        error_status = getattr(result, 'status_code', 500)
+                    
+                    logger.error(f"ProjectX API error when fetching contracts: {error_msg} (status: {error_status})")
+                    raise HTTPException(
+                        status_code=error_status,
+                        detail=error_msg
+                    )
+                
+                # If not error, result is Success[T], safe to unwrap
+                contracts = result.unwrap()
+            except HTTPException:
+                raise
+            except Exception as v2_exc:
+                logger.error(f"Unexpected error in V2 service: {v2_exc}", exc_info=True)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Internal error: {str(v2_exc)[:200]}"
+                )
+        else:
+            # V1 fallback (exception-based)
+            try:
+                if search:
+                    contracts = await projectx_service.search_contracts(search_text=search, live=live)
+                else:
+                    contracts = await projectx_service.get_contracts(live=live)
+                    
+                    # If live contracts return empty, try non-live contracts as fallback
+                    if isinstance(contracts, list) and len(contracts) == 0 and live:
+                        logger.warning("No live contracts found, trying non-live contracts as fallback")
+                        contracts = await projectx_service.get_contracts(live=False)
+            except Exception as api_exc:
+                logger.error(f"ProjectX API error (V1): {api_exc}", exc_info=True)
+                error_msg = str(api_exc)[:200]
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to fetch contracts: {error_msg}"
+                ) from api_exc
     except HTTPException:
-        # Re-raise HTTP exceptions - they'll be handled by exception handler with CORS
         raise
     except Exception as exc:
-        logger.error(f"Unexpected error in contracts endpoint: {exc}", exc_info=True)
-        error_msg = str(exc)
-        if len(error_msg) > 200:
-            error_msg = error_msg[:200] + "..."
+        logger.error(f"Unexpected error in list_market_contracts: {exc}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch contracts: {error_msg}"
-        ) from exc
+            detail=f"Internal server error: {str(exc)[:200]}"
+        )
+    
+    if not contracts:
+        contracts = []
+    
+    def _map_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            if not isinstance(contract, dict):
+                return {}
+            symbol = contract.get("symbol") or contract.get("name") or contract.get("contractName") or ""
+            description = contract.get("description") or contract.get("displayName") or contract.get("name") or ""
+            base_symbol = ""
+            if symbol:
+                for char in symbol:
+                    if char.isalpha():
+                        base_symbol += char
+                    else:
+                        break
+            return {
+                "id": contract.get("id") or contract.get("contractId") or "",
+                "symbol": symbol,
+                "name": contract.get("name") or "",
+                "description": description,
+                "baseSymbol": base_symbol or symbol,
+                "tickSize": contract.get("tickSize"),
+                "tickValue": contract.get("tickValue"),
+                "exchange": contract.get("exchange") or "",
+                "live": contract.get("live", live),
+            }
+        except Exception as map_err:
+            logger.warning(f"Error mapping contract: {map_err}")
+            return {}
+
+    mapped = [_map_contract(c) for c in contracts if c]
+    logger.info(f"Returning {len(mapped)} mapped contracts (from {len(contracts)} raw contracts)")
+    return {"contracts": mapped}
 
 
 @app.get("/api/trading/positions/{account_id}")
@@ -948,8 +1445,18 @@ async def get_positions(account_id: int):
     if not projectx_service:
         raise HTTPException(status_code=503, detail="ProjectX service not initialized")
 
-    positions = await projectx_service.get_positions(account_id=account_id)
-    return {"positions": positions}
+    try:
+        positions = await asyncio.wait_for(
+            projectx_service.get_positions(account_id=account_id),
+            timeout=8.0
+        )
+        return {"positions": positions}
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout fetching positions for account {account_id}")
+        raise HTTPException(status_code=504, detail="Request timeout - backend may be overloaded")
+    except Exception as e:
+        logger.error(f"Error fetching positions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
 
 
 @app.get("/api/trading/pending-orders/{account_id}")
@@ -958,8 +1465,18 @@ async def get_pending_orders(account_id: int):
     if not projectx_service:
         raise HTTPException(status_code=503, detail="ProjectX service not initialized")
 
-    orders = await projectx_service.get_orders(account_id=account_id)
-    return {"orders": orders.get("open", [])}
+    try:
+        orders = await asyncio.wait_for(
+            projectx_service.get_orders(account_id=account_id),
+            timeout=8.0
+        )
+        return {"orders": orders.get("open", [])}
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout fetching pending orders for account {account_id}")
+        raise HTTPException(status_code=504, detail="Request timeout - backend may be overloaded")
+    except Exception as e:
+        logger.error(f"Error fetching pending orders: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch orders: {str(e)}")
 
 
 @app.get("/api/trading/previous-orders/{account_id}")
@@ -968,9 +1485,19 @@ async def get_previous_orders(account_id: int, limit: int = 50):
     if not projectx_service:
         raise HTTPException(status_code=503, detail="ProjectX service not initialized")
 
-    orders = await projectx_service.get_orders(account_id=account_id)
-    recent = orders.get("recent", [])
-    return {"orders": recent[:limit]}
+    try:
+        orders = await asyncio.wait_for(
+            projectx_service.get_orders(account_id=account_id),
+            timeout=8.0
+        )
+        recent = orders.get("recent", [])
+        return {"orders": recent[:limit]}
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout fetching previous orders for account {account_id}")
+        raise HTTPException(status_code=504, detail="Request timeout - backend may be overloaded")
+    except Exception as e:
+        logger.error(f"Error fetching previous orders: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch orders: {str(e)}")
 
 
 @app.post("/api/trading/place-order")
@@ -984,6 +1511,20 @@ async def place_order(order: ManualOrderRequest):
         )
 
     logger.info(f"Manual order received: {order.model_dump()}")
+
+    # Check if markets are open
+    is_market_open = _is_trading_hours()
+    market_warning = None
+    if not is_market_open:
+        ct = pytz.timezone("America/Chicago")
+        now = datetime.now(ct)
+        market_warning = (
+            f"Warning: Markets are currently closed. "
+            f"Trading hours are 5:00 PM CT to 3:10 PM CT. "
+            f"Current time: {now.strftime('%I:%M %p CT')}. "
+            f"Order submitted - check TopstepX for order status."
+        )
+        logger.warning(f"Order placed during closed hours: {market_warning}")
 
     stop_loss_ticks = int(order.stop_loss) if order.stop_loss is not None else None
     take_profit_ticks = int(order.take_profit) if order.take_profit is not None else None
@@ -1003,6 +1544,23 @@ async def place_order(order: ManualOrderRequest):
             stop_loss_ticks=stop_loss_ticks,
             take_profit_ticks=take_profit_ticks,
         )
+        
+        # Add market hours warning to response if applicable
+        if market_warning:
+            if isinstance(response, dict):
+                response["market_warning"] = market_warning
+                response["market_open"] = False
+            else:
+                # If response is not a dict, wrap it
+                response = {
+                    "order_response": response,
+                    "market_warning": market_warning,
+                    "market_open": False
+                }
+        else:
+            if isinstance(response, dict):
+                response["market_open"] = True
+        
         return response
     except Exception as exc:
         logger.error(f"ProjectX order placement failed: {exc}", exc_info=True)
@@ -1014,33 +1572,43 @@ async def place_order(order: ManualOrderRequest):
 
 @app.post("/api/trading/accounts/{account_id}/flatten")
 async def flatten_account_positions(account_id: int):
-    """Close all open positions for an account."""
-    if not projectx_service:
+    """Close all open positions for an account (V2 - Result-based)."""
+    service = projectx_service_v2 or projectx_service
+    
+    if not service:
         logger.warning(f"ProjectX service not initialized when flatten requested for account {account_id}")
         raise HTTPException(
             status_code=503,
             detail="ProjectX service not initialized. Please wait for startup to complete."
         )
 
-    try:
-        result = await projectx_service.flatten_account(account_id=account_id)
-        return {"status": "ok", "result": result}
-    except ValueError as e:
-        # Known user errors (e.g., invalid account_id)
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        ) from e
-    except Exception as e:
-        logger.error(f"Error flattening account {account_id}: {e}", exc_info=True)
-        # Surface upstream errors with sanitized message
-        error_msg = str(e)
-        if len(error_msg) > 200:
-            error_msg = error_msg[:200] + "..."
-        raise HTTPException(
-            status_code=500,
-            detail=f"Flatten failed: {error_msg}"
-        ) from e
+    # Use V2 service if available
+    if projectx_service_v2:
+        result = await projectx_service_v2.flatten_account(account_id=account_id)
+        
+        if result.is_error():
+            logger.error(f"Error flattening account {account_id}: {result.message}")
+            raise HTTPException(
+                status_code=result.status_code,
+                detail=result.message
+            )
+        
+        data = result.unwrap()
+        return {"status": "ok", "result": data}
+    else:
+        # V1 fallback
+        try:
+            result = await projectx_service.flatten_account(account_id=account_id)
+            return {"status": "ok", "result": result}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:
+            logger.error(f"Error flattening account {account_id}: {e}", exc_info=True)
+            error_msg = str(e)[:200]
+            raise HTTPException(
+                status_code=500,
+                detail=f"Flatten failed: {error_msg}"
+            ) from e
 
 
 @app.post("/api/strategies/{account_id}/activate")
@@ -1059,56 +1627,148 @@ async def activate_strategy(account_id: str, request: StrategyActivationRequest)
 
 
 async def broadcast_realtime_data():
-    """Background task to broadcast real-time data to WebSocket clients."""
-    # This function should run forever, but if it exits, the wrapper will restart it
+    """Background task to broadcast real-time data to WebSocket clients.
+    
+    This runs forever and is wrapped in safe_broadcast_wrapper which restarts it on crashes.
+    All operations are defensive - exceptions are caught and logged without crashing the loop.
+    """
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+    
     while True:
-        await asyncio.sleep(1)  # Broadcast every second
-        
-        if websocket_manager.get_connection_count() == 0:
-            continue
-        
-        # Collect real-time data
-        data = {}
-        
-        # Get account balance
         try:
-            if projectx_service:
-                data["accountBalance"] = await projectx_service.get_account_balance()
-        except Exception as e:
-            logger.debug(f"Error fetching balance for broadcast: {e}")
-        
-        # Get positions with live P&L
-        try:
-            if projectx_service:
-                positions = await projectx_service.get_positions()
-                # Calculate live P&L for each position using current quotes
-                for pos in positions:
-                    if pos.get("symbol") and pos.get("entry_price") and pos.get("quantity"):
-                        # P&L is already calculated in get_open_positions, but ensure it's included
-                        if pos.get("unrealized_pnl") is None:
-                            # Fallback calculation if not provided
-                            entry_price = pos.get("entry_price", 0)
-                            current_price = pos.get("current_price", entry_price)
-                            quantity = pos.get("quantity", 0)
-                            direction = 1 if pos.get("side") == "LONG" else -1
-                            pos["unrealized_pnl"] = (current_price - entry_price) * abs(quantity) * direction
-                data["positions"] = positions
-        except Exception as e:
-            logger.debug(f"Error fetching positions for broadcast: {e}")
-        
-        # Get stats from ProjectX
-        try:
-            if projectx_service:
-                summary = await projectx_service.get_trades_summary()
-                data.update(summary["metrics"])
-        except Exception as e:
-            logger.debug(f"Error fetching stats for broadcast: {e}")
-        
-        # Only broadcast if we have data
-        if data:
-            data["type"] = "realtime_snapshot"
-            data["timestamp"] = datetime.utcnow().isoformat()
-            await websocket_manager.broadcast(data)
+            await asyncio.sleep(1)  # Broadcast every second
+            
+            if websocket_manager.get_connection_count() == 0:
+                consecutive_errors = 0  # Reset on idle
+                continue
+            
+            # Collect real-time data - all operations defensive
+            data = {}
+            
+            # Get account balance
+            try:
+                if projectx_service:
+                    data["accountBalance"] = await projectx_service.get_account_balance()
+            except Exception as e:
+                logger.debug(f"Error fetching balance for broadcast: {e}")
+            
+            # Get positions with live P&L - fetch for all accounts
+            try:
+                if projectx_service:
+                    # Get all accounts first
+                    accounts = await projectx_service.get_accounts()
+                    all_positions = []
+                    
+                    # Fetch positions for each account
+                    for account in accounts:
+                        account_id = account.get("id")
+                        if account_id:
+                            try:
+                                # Get realized P&L from trades for this specific account (includes commissions)
+                                realized_pnl_by_symbol = await projectx_service.get_realized_pnl_for_positions(account_id=account_id)
+                                
+                                # Get positions with correct P&L calculations (includes tick/point multipliers)
+                                # projectx_service.get_positions() already calculates P&L correctly with contract metadata
+                                positions = await projectx_service.get_positions(account_id=account_id)
+                                
+                                # Debug logging for position fetch
+                                if positions:
+                                    logger.debug(f"[Broadcast] Fetched {len(positions)} positions for account {account_id}")
+                                
+                                # Only update current_price from cached quotes and add realized P&L
+                                # Do NOT recalculate unrealized P&L here - projectx_service already did it correctly
+                                for pos in positions:
+                                    pos["account_id"] = account_id
+                                    
+                                    # Add realized P&L from trades if available for this symbol
+                                    symbol = pos.get("symbol", "").upper()
+                                    if symbol in realized_pnl_by_symbol:
+                                        pos["realized_pnl"] = realized_pnl_by_symbol[symbol]
+                                    
+                                    # Update current_price from cached quotes if available (for live updates)
+                                    # projectx_service will recalculate P&L with correct multipliers on next call
+                                    cached_price = shared_market_client.get_cached_quote(symbol) if shared_market_client else None
+                                    if cached_price is not None and cached_price != pos.get("current_price"):
+                                        # Price changed - need to recalculate P&L with correct multipliers
+                                        pos["current_price"] = cached_price
+                                        
+                                        # Recalculate P&L using the multipliers that projectx_service provided
+                                        entry_price = pos.get("entry_price", 0)
+                                        quantity = pos.get("quantity", 0)
+                                        side = pos.get("side", "LONG").upper()
+                                        direction = 1 if side == "LONG" else -1
+                                        
+                                        # Use the price multiplier from contract metadata (already in position from projectx_service)
+                                        point_value = pos.get("point_value")
+                                        tick_value = pos.get("tick_value")
+                                        tick_size = pos.get("tick_size")
+                                        
+                                        if entry_price > 0 and quantity != 0:
+                                            price_diff = cached_price - entry_price
+                                            # Calculate with proper multipliers (same logic as projectx_service)
+                                            if point_value:
+                                                unrealized = price_diff * point_value * abs(quantity) * direction
+                                            elif tick_value and tick_size and tick_size != 0:
+                                                ticks = price_diff / tick_size
+                                                unrealized = ticks * tick_value * abs(quantity) * direction
+                                            else:
+                                                # Fallback if no multipliers available
+                                                unrealized = price_diff * abs(quantity) * direction
+                                            
+                                            pos["unrealized_pnl"] = unrealized
+                                            
+                                            # Recalculate current_value and pnl_percent
+                                            price_multiplier = point_value or (tick_value / tick_size if tick_value and tick_size and tick_size != 0 else 1.0)
+                                            pos["current_value"] = cached_price * abs(quantity) * price_multiplier
+                                            
+                                            entry_value = pos.get("entry_value", 0)
+                                            if entry_value > 0:
+                                                pos["pnl_percent"] = (unrealized / entry_value) * 100
+                                            
+                                            # Debug logging for P&L recalculation
+                                            logger.debug(
+                                                f"[Broadcast] Updated {symbol}: price={cached_price:.2f}, "
+                                                f"unrealized_pnl={unrealized:.2f}, multiplier={price_multiplier}"
+                                            )
+                                    
+                                all_positions.extend(positions)
+                            except Exception as e:
+                                logger.debug(f"Error fetching positions for account {account_id}: {e}")
+                    
+                    data["positions"] = all_positions
+            except Exception as e:
+                logger.debug(f"Error fetching positions for broadcast: {e}")
+            
+            # Get stats from ProjectX
+            try:
+                if projectx_service:
+                    summary = await projectx_service.get_trades_summary()
+                    data.update(summary["metrics"])
+            except Exception as e:
+                logger.debug(f"Error fetching stats for broadcast: {e}")
+            
+            # Only broadcast if we have data
+            if data:
+                data["type"] = "realtime_snapshot"
+                data["timestamp"] = datetime.utcnow().isoformat()
+                await websocket_manager.broadcast(data)
+                consecutive_errors = 0  # Reset on success
+                
+        except Exception as outer_exc:
+            consecutive_errors += 1
+            logger.error(
+                f"Error in broadcast loop (consecutive: {consecutive_errors}): {outer_exc}",
+                exc_info=True
+            )
+            
+            # If too many consecutive errors, back off longer
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error(f"Too many consecutive broadcast errors ({consecutive_errors}), backing off 30s")
+                await asyncio.sleep(30)
+                consecutive_errors = 0  # Reset after backoff
+            else:
+                await asyncio.sleep(2)  # Brief pause before retry
 
 
 if __name__ == "__main__":

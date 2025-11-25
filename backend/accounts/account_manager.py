@@ -1,10 +1,9 @@
 """Account manager for orchestrating multiple trading bots."""
 
 import asyncio
-import asyncio
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
@@ -24,7 +23,9 @@ class AccountManager:
         self.running = False
         self.manual_orders: Dict[str, List[Dict]] = defaultdict(list)
         self.active_strategies: Dict[str, Optional[str]] = {}
+        self.bot_activity: Dict[str, List[Dict]] = defaultdict(list)  # Activity log per account
         self._manual_orders_lock = asyncio.Lock()
+        self._activity_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Initialize account manager and load accounts."""
@@ -79,15 +80,39 @@ class AccountManager:
         # Create account-specific settings
         account_settings = self._create_account_settings(account_config)
 
-        # Create and initialize bot
-        bot = TradingBot(account_settings, account_config)
-        await bot.initialize()
+        async def activity_logger(activity: Dict[str, Any]):
+            await self._log_activity(account_id, activity)
 
-        # Start bot in background
-        asyncio.create_task(bot.start())
+        # Create bot (initialization happens in __init__)
+        bot = TradingBot(account_settings, account_config, activity_logger=activity_logger)
+
+        # Start bot in background with error handling
+        async def start_bot_with_error_handling():
+            """Start bot with proper error handling to ensure it persists."""
+            try:
+                await bot.start()
+            except Exception as e:
+                logger.error(
+                    f"Bot for account {account_id} encountered an error: {e}",
+                    exc_info=True
+                )
+                # Don't remove from bots dict - keep it so it can be restarted
+                # The bot's running flag will be False, but it stays in memory
+        
+        # Create and store the task
+        task = asyncio.create_task(start_bot_with_error_handling())
+        bot._task = task  # Store task reference in bot for potential cleanup
 
         self.bots[account_id] = bot
-        logger.info(f"Account {account_id} started")
+        logger.info(f"Account {account_id} started (running in background)")
+        
+        # Log bot start activity
+        asyncio.create_task(self._log_activity(account_id, {
+            "type": "bot_started",
+            "timestamp": datetime.utcnow().isoformat(),
+            "message": f"Bot started for account {account_id}",
+            "strategies": account_config.enabled_strategies,
+        }))
 
     async def stop_account(self, account_id: str) -> None:
         """Stop trading bot for a specific account."""
@@ -102,6 +127,13 @@ class AccountManager:
 
         del self.bots[account_id]
         logger.info(f"Account {account_id} stopped")
+        
+        # Log bot stop activity
+        asyncio.create_task(self._log_activity(account_id, {
+            "type": "bot_stopped",
+            "timestamp": datetime.utcnow().isoformat(),
+            "message": f"Bot stopped for account {account_id}",
+        }))
 
     def _create_account_settings(self, account_config: AccountConfig) -> Settings:
         """Create Settings instance for an account."""
@@ -286,6 +318,54 @@ class AccountManager:
         """Return manual order history for account."""
         async with self._manual_orders_lock:
             return list(self.manual_orders.get(account_id, []))
+    
+    async def _log_activity(self, account_id: str, activity: Dict) -> None:
+        """Log bot activity for an account."""
+        async with self._activity_lock:
+            activity = dict(activity)
+            activity.setdefault("timestamp", datetime.utcnow().isoformat())
+            self.bot_activity[account_id].insert(0, activity)
+            # Keep only last 100 activities per account
+            self.bot_activity[account_id] = self.bot_activity[account_id][:100]
+    
+    async def get_bot_activity(self, account_id: str, limit: int = 50) -> List[Dict]:
+        """Get recent bot activity for an account."""
+        async with self._activity_lock:
+            activities = self.bot_activity.get(account_id, [])
+            return activities[:limit]
+    
+    def get_bot_health(self, account_id: str) -> Dict:
+        """Get bot health/verification info."""
+        bot = self.bots.get(account_id)
+        if not bot:
+            return {
+                "running": False,
+                "verified": False,
+                "message": "Bot not running",
+            }
+        
+        # Check if bot is actually running
+        is_running = bot.running if hasattr(bot, 'running') else False
+        
+        # Get recent activity count
+        recent_activity = len(self.bot_activity.get(account_id, []))
+        
+        # Check if bot has active components
+        has_components = {
+            "api_client": hasattr(bot, 'api_client') and bot.api_client is not None,
+            "order_manager": hasattr(bot, 'order_manager') and bot.order_manager is not None,
+            "risk_manager": hasattr(bot, 'risk_manager') and bot.risk_manager is not None,
+            "strategy_selector": hasattr(bot, 'strategy_selector') and bot.strategy_selector is not None,
+        }
+        
+        return {
+            "running": is_running,
+            "verified": is_running and all(has_components.values()),
+            "components": has_components,
+            "recent_activity_count": recent_activity,
+            "last_activity": self.bot_activity.get(account_id, [{}])[0] if self.bot_activity.get(account_id) else None,
+            "message": "Bot is running and verified" if is_running and all(has_components.values()) else "Bot may not be fully operational",
+        }
 
     def set_active_strategy(self, account_id: str, strategy_name: Optional[str]) -> None:
         """Track currently active quick strategy per account."""
